@@ -141,9 +141,9 @@ def cmd_login() -> None:
     help="Only download BeatSaver maps; skip local generation",
 )
 @click.option(
-    "--skip-existing",
+    "--force", "-f",
     is_flag=True, default=False,
-    help="Skip tracks whose output folder already exists",
+    help="Regenerate even if output folder already exists (analysis is still cached)",
 )
 @click.option(
     "--dry-run",
@@ -194,7 +194,7 @@ def cmd_import(
     min_score: Optional[float],
     difficulties: Optional[str],
     skip_generate: bool,
-    skip_existing: bool,
+    force: bool,
     dry_run: bool,
     max_generate: int,
     no_keep_audio: bool,
@@ -232,7 +232,8 @@ def cmd_import(
     if difficulties:
         cfg.difficulties = [d.strip() for d in difficulties.split(",")]
     cfg.skip_generate = skip_generate
-    cfg.skip_existing = skip_existing
+    if force:
+        cfg.skip_existing = False
     cfg.max_generate = max_generate
     if no_keep_audio:
         cfg.keep_audio = False

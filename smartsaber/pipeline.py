@@ -13,6 +13,7 @@ The pipeline:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -25,6 +26,7 @@ from typing import Callable, Optional
 
 import httpx
 
+from smartsaber.analysis_cache import AnalysisCache
 from smartsaber.analyzer import analyze
 from smartsaber.beatsaver import find_map, download_map
 from smartsaber.bs_cache import BSCache
@@ -130,6 +132,7 @@ def run(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load persistent caches
+    analysis_cache = AnalysisCache()
     bs_cache = BSCache()
     yt_cache = YTCache()
     overrides = _load_overrides(config.overrides_file)
@@ -282,7 +285,7 @@ def run(
     completed_count = 0
     counter_lock = threading.Lock()
 
-    def _do_download(i: int, track: Track) -> tuple[int, Track, Optional[Path]]:
+    def _do_download(track: Track) -> tuple[Track, Optional[Path]]:
         on_track_stage(track, "Downloading audio")
         audio_path = fetch_audio(
             track,
@@ -291,16 +294,16 @@ def run(
             cache=yt_cache,
             resolution=resolution_map.get(track.source_id),
         )
-        return i, track, audio_path
+        return track, audio_path
 
-    def _do_generate(i: int, track: Track, audio_path: Path) -> GenerationResult:
+    def _do_generate(track: Track, audio_path: Path) -> GenerationResult:
         return _generate_from_audio(
             track,
             audio_path,
             output_dir,
             difficulties_enum,
-            random.Random(1337 + i),
             config,
+            analysis_cache=analysis_cache,
             on_stage=lambda stage: on_track_stage(track, stage),
         )
 
@@ -308,8 +311,8 @@ def run(
     gen_executor = ThreadPoolExecutor(max_workers=config.generate_workers)
 
     dl_futures = {
-        dl_executor.submit(_do_download, i, track): track
-        for i, track in enumerate(to_generate)
+        dl_executor.submit(_do_download, track): track
+        for track in to_generate
     }
     gen_futures: dict = {}
 
@@ -329,7 +332,7 @@ def run(
         # Feed completed downloads straight into the generation pool
         for dl_future in as_completed(dl_futures):
             try:
-                i, track, audio_path = dl_future.result()
+                track, audio_path = dl_future.result()
             except Exception as exc:
                 track = dl_futures[dl_future]
                 on_error(track, exc)
@@ -346,7 +349,7 @@ def run(
                 ))
                 continue
 
-            gen_futures[gen_executor.submit(_do_generate, i, track, audio_path)] = track
+            gen_futures[gen_executor.submit(_do_generate, track, audio_path)] = track
 
         # Collect generation results
         for gen_future in as_completed(gen_futures):
@@ -407,13 +410,24 @@ def _generate_from_audio(
     audio_path: Path,
     output_dir: Path,
     difficulties: list[Difficulty],
-    rng: random.Random,
     config: SmartSaberConfig,
+    analysis_cache: Optional[AnalysisCache] = None,
     on_stage: Callable[[str], None] = lambda _: None,
 ) -> GenerationResult:
     """CPU-bound half: analyse audio, generate notes, write map files."""
+    # Stable RNG seed derived from the audio filename (video ID or file stem).
+    # This ensures the same track always generates identical notes regardless
+    # of its position in the playlist.
+    seed = int.from_bytes(hashlib.md5(audio_path.stem.encode()).digest()[:4], "big")
+    rng = random.Random(seed)
+
     on_stage("Analysing BPM")
-    analysis = analyze(audio_path)
+    cache_key = audio_path.stem
+    analysis = analysis_cache.get(cache_key) if analysis_cache else None
+    if analysis is None:
+        analysis = analyze(audio_path)
+        if analysis_cache:
+            analysis_cache.put(cache_key, analysis)
 
     map_info = MapInfo(
         song_name=track.title,

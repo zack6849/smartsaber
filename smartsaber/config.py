@@ -31,7 +31,7 @@ class SmartSaberConfig:
 
     # Generation
     skip_generate: bool = False
-    skip_existing: bool = False
+    skip_existing: bool = True
     max_generate: int = 0          # 0 = unlimited
     difficulties: list[str] = field(
         default_factory=lambda: ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"]
