@@ -1,13 +1,15 @@
 """Tests for Info.dat / difficulty .dat JSON format correctness."""
 
 import json
+import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
 
-from smartsaber.mapbuilder import _build_difficulty_dat, _build_info_dat, compute_map_hash
+from smartsaber.mapbuilder import build_map, _build_difficulty_dat, _build_info_dat, compute_map_hash
 from smartsaber.models import (
     CutDirection,
     Difficulty,
@@ -166,3 +168,119 @@ def test_compute_map_hash():
         # Hash must be deterministic
         h2 = compute_map_hash(tmp_path)
         assert h == h2
+
+
+# ---------------------------------------------------------------------------
+# build_map — audio skip optimization
+# ---------------------------------------------------------------------------
+
+def _make_fake_audio(path: Path) -> None:
+    """Write a minimal OGG file (just enough bytes so it's not empty)."""
+    path.write_bytes(b"OggS" + b"\x00" * 100)
+
+
+def test_build_map_skips_audio_when_egg_exists():
+    """If song.egg already exists and is up-to-date, build_map should not overwrite it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        audio_src = tmp_path / "source.ogg"
+        _make_fake_audio(audio_src)
+
+        info = _sample_info()
+        diffs = _sample_difficulties()
+
+        # First build — creates song.egg
+        folder = build_map(info, diffs, audio_src, tmp_path,
+                           song_name_for_folder="Test", artist_for_folder="Artist")
+        egg_path = folder / "song.egg"
+        assert egg_path.exists()
+        first_mtime = egg_path.stat().st_mtime
+
+        # Wait a tiny bit so any re-write would have a different mtime
+        time.sleep(0.05)
+
+        # Second build — same source, egg should be skipped (mtime unchanged)
+        build_map(info, diffs, audio_src, tmp_path,
+                  song_name_for_folder="Test", artist_for_folder="Artist")
+        assert egg_path.stat().st_mtime == first_mtime
+
+
+def test_build_map_skips_audio_when_src_is_egg():
+    """When audio_path points to the existing song.egg itself, don't copy over itself."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        audio_src = tmp_path / "source.ogg"
+        _make_fake_audio(audio_src)
+
+        info = _sample_info()
+        diffs = _sample_difficulties()
+
+        # First build creates song.egg
+        folder = build_map(info, diffs, audio_src, tmp_path,
+                           song_name_for_folder="Test", artist_for_folder="Artist")
+        egg_path = folder / "song.egg"
+        first_mtime = egg_path.stat().st_mtime
+
+        time.sleep(0.05)
+
+        # Now build again, passing the egg itself as the source (regen scenario)
+        build_map(info, diffs, egg_path, tmp_path,
+                  song_name_for_folder="Test", artist_for_folder="Artist")
+        # Should not have been rewritten
+        assert egg_path.stat().st_mtime == first_mtime
+
+
+def test_build_map_skips_cover_when_exists():
+    """If cover.jpg already exists, build_map should not rewrite it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        audio_src = tmp_path / "source.ogg"
+        _make_fake_audio(audio_src)
+
+        info = _sample_info()
+        diffs = _sample_difficulties()
+
+        # First build
+        folder = build_map(info, diffs, audio_src, tmp_path,
+                           song_name_for_folder="Test", artist_for_folder="Artist")
+        cover_path = folder / "cover.jpg"
+        assert cover_path.exists()
+        first_mtime = cover_path.stat().st_mtime
+
+        time.sleep(0.05)
+
+        # Second build — cover should be skipped
+        build_map(info, diffs, audio_src, tmp_path,
+                  song_name_for_folder="Test", artist_for_folder="Artist")
+        assert cover_path.stat().st_mtime == first_mtime
+
+
+def test_build_map_rewrites_dat_files():
+    """Even when audio/cover are skipped, .dat files should always be rewritten."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        audio_src = tmp_path / "source.ogg"
+        _make_fake_audio(audio_src)
+
+        info = _sample_info()
+        diffs = _sample_difficulties()
+
+        # First build
+        folder = build_map(info, diffs, audio_src, tmp_path,
+                           song_name_for_folder="Test", artist_for_folder="Artist")
+        info_dat = folder / "Info.dat"
+        first_content = info_dat.read_text()
+
+        # Change the BPM so Info.dat content changes
+        info2 = _sample_info()
+        info2 = MapInfo(
+            song_name="Test Song", song_sub_name="",
+            song_author_name="Test Artist", bpm=140.0,
+        )
+        build_map(info2, diffs, audio_src, tmp_path,
+                  song_name_for_folder="Test", artist_for_folder="Artist")
+        second_content = info_dat.read_text()
+
+        assert first_content != second_content
+        assert '"140.0"' in second_content or "140.0" in second_content
+

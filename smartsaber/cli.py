@@ -6,30 +6,46 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import click
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    SpinnerColumn,
-    TextColumn,
-    TimeElapsedColumn,
-)
-from rich.table import Table
 
 from smartsaber import __version__
 from smartsaber.config import load_config, SmartSaberConfig
 from smartsaber.models import GenerationResult, Track
-from smartsaber.providers import get_provider
-from smartsaber.providers.spotify import SpotifyProvider
-from smartsaber.youtube import YouTubeResolution
-import smartsaber.pipeline as pipeline_mod
 
-console = Console()
-err_console = Console(stderr=True)
+# Heavy packages (yt_dlp, librosa, spotipy, numpy, rich) are imported lazily
+# inside the commands that need them.  Type annotations only here.
+if TYPE_CHECKING:
+    from smartsaber.youtube import YouTubeResolution
+    import smartsaber.pipeline as pipeline_mod
+
+
+class _LazyConsole:
+    """Defers `rich.Console` import until the first method call."""
+
+    def __init__(self, **kwargs: object) -> None:
+        self._kwargs = kwargs
+        self._inner: object = None
+
+    def _get(self):  # type: ignore[return]
+        if self._inner is None:
+            from rich.console import Console
+            self._inner = Console(**self._kwargs)
+        return self._inner
+
+    def __getattr__(self, name: str):  # type: ignore[return]
+        return getattr(self._get(), name)
+
+    def __enter__(self):
+        return self._get().__enter__()
+
+    def __exit__(self, *args: object) -> None:
+        self._get().__exit__(*args)
+
+
+console = _LazyConsole()
+err_console = _LazyConsole(stderr=True)
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +74,7 @@ def cmd_login() -> None:
     Set SPOTIPY_REDIRECT_URI in your .env to match.
     """
     import os
+    from smartsaber.providers.spotify import SpotifyProvider
 
     provider = SpotifyProvider()
     redirect_uri = os.getenv("SPOTIPY_REDIRECT_URI", "")
@@ -141,9 +158,16 @@ def cmd_login() -> None:
     help="Only download BeatSaver maps; skip local generation",
 )
 @click.option(
-    "--force", "-f",
+    "--force", "-F",
     is_flag=True, default=False,
     help="Regenerate even if output folder already exists (analysis is still cached)",
+)
+@click.option(
+    "--regen",
+    is_flag=True, default=False,
+    help="Re-generate notes & lighting for existing maps using cached analysis. "
+         "Skips BeatSaver search, audio download, and audio analysis. "
+         "Use this after updating the generator to apply changes to existing maps.",
 )
 @click.option(
     "--dry-run",
@@ -185,6 +209,12 @@ def cmd_login() -> None:
     is_flag=True, default=False,
     help="Enable verbose logging",
 )
+@click.option(
+    "--debug",
+    is_flag=True, default=False,
+    help="Disable progress bars and print detailed per-track timing, cache stats, "
+         "and pipeline phase durations for troubleshooting performance.",
+)
 def cmd_import(
     url: Optional[str],
     from_file: Optional[Path],
@@ -195,6 +225,7 @@ def cmd_import(
     difficulties: Optional[str],
     skip_generate: bool,
     force: bool,
+    regen: bool,
     dry_run: bool,
     max_generate: int,
     no_keep_audio: bool,
@@ -202,6 +233,7 @@ def cmd_import(
     download_workers: Optional[int],
     generate_workers: Optional[int],
     verbose: bool,
+    debug: bool,
 ) -> None:
     """Import a Spotify playlist into Beat Saber custom maps.
 
@@ -215,12 +247,14 @@ def cmd_import(
     """
     # --- Logging ---
     logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.WARNING,
+        level=logging.DEBUG if (verbose or debug) else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
 
     # --- Config ---
     cfg = load_config()
+    if debug:
+        cfg.debug = True
     if output:
         cfg.output_dir = output
     if title_threshold is not None:
@@ -233,6 +267,9 @@ def cmd_import(
         cfg.difficulties = [d.strip() for d in difficulties.split(",")]
     cfg.skip_generate = skip_generate
     if force:
+        cfg.skip_existing = False
+    if regen:
+        cfg.regen_only = True
         cfg.skip_existing = False
     cfg.max_generate = max_generate
     if no_keep_audio:
@@ -267,6 +304,7 @@ def cmd_import(
         )
         console.print(f"[bold]{from_file.name}[/bold] — {len(tracks)} tracks")
     elif url:
+        from smartsaber.providers import get_provider
         provider = get_provider(url)
         if provider is None:
             err_console.print(f"[red]Unsupported URL:[/red] {url}")
@@ -294,124 +332,229 @@ def cmd_import(
         return
 
     # --- Run pipeline with Rich callbacks ---
+    import time as _cli_time
     import threading as _threading
-    _track_tasks: dict[str, int] = {}   # source_id → Rich task ID
-    _track_tasks_lock = _threading.Lock()
+    import smartsaber.pipeline as pipeline_mod
 
-    try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            console=console,
-            transient=True,
-        ) as progress:
-            task_id = progress.add_task("Starting…", total=len(tracks))
+    if debug:
+        # ---------------------------------------------------------------
+        # DEBUG MODE — no Rich progress bars, plain timestamped output
+        # ---------------------------------------------------------------
+        _t0 = _cli_time.perf_counter()
 
-            def on_progress(stage: str, current: int, total: int) -> None:
-                label = {
-                    "beatsaver_search": "Searching BeatSaver",
-                    "beatsaver_download": "Downloading BeatSaver maps",
-                    "youtube_resolve": "Resolving YouTube URLs",
-                    "generate": "Generating maps",
-                }.get(stage, stage)
-                progress.update(task_id, description=label, completed=current, total=total or 1)
+        def _dbg(msg: str) -> None:
+            elapsed = _cli_time.perf_counter() - _t0
+            print(f"[DEBUG +{elapsed:7.2f}s] {msg}", flush=True)
 
-            def on_batch_confirm(unmatched: list[Track]) -> list[Track]:
-                progress.stop()
-                _show_unmatched_table(unmatched)
-                if not click.confirm(
-                    f"\nGenerate {len(unmatched)} maps locally from YouTube audio?",
-                    default=True,
-                ):
-                    console.print("[yellow]Skipping local generation.[/yellow]")
-                    progress.start()
-                    return []
-                progress.start()
-                return unmatched
+        _dbg(f"Debug mode enabled — Rich progress bars disabled")
+        _dbg(f"Config: output_dir={cfg.output_dir}")
+        _dbg(f"Config: regen_only={cfg.regen_only} skip_existing={cfg.skip_existing}")
+        _dbg(f"Config: download_workers={cfg.download_workers} generate_workers={cfg.generate_workers}")
+        _dbg(f"Config: difficulties={cfg.difficulties}")
+        _dbg(f"Tracks: {len(tracks)}")
 
-            def on_url_review(
-                resolutions: list[YouTubeResolution],
-            ) -> list[YouTubeResolution]:
-                import questionary
+        def on_progress_debug(stage: str, current: int, total: int) -> None:
+            _dbg(f"Progress: {stage} {current}/{total}")
 
-                progress.stop()
-                _show_url_review_table(resolutions)
+        def on_batch_confirm_debug(unmatched: list[Track]) -> list[Track]:
+            _show_unmatched_table(unmatched)
+            if not click.confirm(
+                f"\nGenerate {len(unmatched)} maps locally from YouTube audio?",
+                default=True,
+            ):
+                console.print("[yellow]Skipping local generation.[/yellow]")
+                return []
+            return unmatched
 
-                choices = [
-                    questionary.Choice(
-                        title=_resolution_choice_label(r),
-                        value=i,
+        def on_url_review_debug(
+            resolutions: list["YouTubeResolution"],
+        ) -> list["YouTubeResolution"]:
+            from smartsaber import _tui
+            _show_url_review_table(resolutions)
+            labels = [_resolution_choice_label(r) for r in resolutions]
+            chosen_labels = _tui.checkbox(
+                "Select tracks to override (space toggle, enter when done):",
+                choices=labels,
+            )
+            label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
+            selected = [label_to_idx[lbl] for lbl in chosen_labels if lbl in label_to_idx]
+            if selected:
+                for idx in selected:
+                    r = resolutions[idx]
+                    new_url = _tui.text(
+                        f"YouTube URL for '{r.track.artist} \u2013 {r.track.title}'",
                     )
-                    for i, r in enumerate(resolutions)
-                ]
+                    if new_url and new_url.strip():
+                        resolutions[idx] = YouTubeResolution(
+                            track=r.track,
+                            url=new_url.strip(),
+                            duration_diff_s=0.0,
+                            source="override",
+                        )
+                        print(f"  ✓ Override set for '{r.track.title}'")
+            return resolutions
 
-                selected = questionary.checkbox(
-                    "Select tracks to override (↑↓ navigate, space select, enter when done):",
-                    choices=choices,
-                ).ask()  # returns None if the user hits Ctrl+C
+        def on_track_stage_debug(track: Track, stage: str) -> None:
+            _dbg(f"Stage: {track.artist} – {track.title} → {stage}")
 
-                if selected:
-                    for idx in selected:
-                        r = resolutions[idx]
-                        new_url = questionary.text(
-                            f"YouTube URL for '{r.track.artist} – {r.track.title}':",
-                        ).ask()
-                        if new_url and new_url.strip():
-                            resolutions[idx] = YouTubeResolution(
-                                track=r.track,
-                                url=new_url.strip(),
-                                duration_diff_s=0.0,
-                                source="override",
-                            )
-                            console.print(f"  [green]✓[/green] Override set for '{r.track.title}'")
+        def on_track_complete_debug(track: Track, result: GenerationResult) -> None:
+            if result.success:
+                src = "BeatSaver" if result.was_beatsaver else "Generated"
+                _dbg(f"DONE: ✓ {track.artist} – {track.title} [{src}]")
+            else:
+                _dbg(f"DONE: ✗ {track.artist} – {track.title} [Error: {result.error}]")
 
-                progress.start()
-                return resolutions
+        def on_error_debug(track: Track, exc: Exception) -> None:
+            _dbg(f"ERROR: {track.artist} – {track.title}: {exc}")
 
-            def on_track_stage(track: Track, stage: str) -> None:
-                label = f"  [dim]{track.artist} – {track.title}[/dim]  [cyan]{stage}[/cyan]"
-                with _track_tasks_lock:
-                    if track.source_id not in _track_tasks:
-                        tid = progress.add_task(label, total=None)
-                        _track_tasks[track.source_id] = tid
-                    else:
-                        progress.update(_track_tasks[track.source_id], description=label)
-
-            def on_track_complete(track: Track, result: GenerationResult) -> None:
-                # Hide the per-track spinner row
-                with _track_tasks_lock:
-                    tid = _track_tasks.pop(track.source_id, None)
-                    if tid is not None:
-                        progress.update(tid, visible=False)
-                if result.success:
-                    status = "[green]✓[/green]"
-                    src = "BeatSaver" if result.was_beatsaver else "Generated"
-                else:
-                    status = "[red]✗[/red]"
-                    src = f"Error: {result.error}"
-                console.log(f"{status} {track.artist} – {track.title} [{src}]")
-
-            def on_error(track: Track, exc: Exception) -> None:
-                console.log(f"[red]Error[/red] processing '{track.title}': {exc}")
-
+        try:
             result = pipeline_mod.run(
                 tracks=tracks,
                 config=cfg,
                 playlist_info=playlist_info,
-                on_progress=on_progress,
-                on_batch_confirm=on_batch_confirm,
-                on_url_review=on_url_review,
-                on_track_complete=on_track_complete,
-                on_track_stage=on_track_stage,
-                on_error=on_error,
+                on_progress=on_progress_debug,
+                on_batch_confirm=on_batch_confirm_debug,
+                on_url_review=on_url_review_debug,
+                on_track_complete=on_track_complete_debug,
+                on_track_stage=on_track_stage_debug,
+                on_error=on_error_debug,
+                on_debug=_dbg,
             )
+        except KeyboardInterrupt:
+            print("\nInterrupted.")
+            os._exit(130)
 
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted.[/yellow]")
-        os._exit(130)
+        _total_elapsed = _cli_time.perf_counter() - _t0
+        _dbg(f"CLI total elapsed: {_total_elapsed:.2f}s")
+
+    else:
+        # ---------------------------------------------------------------
+        # NORMAL MODE — Rich progress bars
+        # ---------------------------------------------------------------
+        from rich.progress import (
+            BarColumn, MofNCompleteColumn, Progress,
+            SpinnerColumn, TextColumn, TimeElapsedColumn,
+        )
+        _track_tasks: dict[str, int] = {}   # source_id → Rich task ID
+        _track_tasks_lock = _threading.Lock()
+        # Show one spinner row per concurrent worker so the UI reflects actual
+        # parallelism.  Downloads and generation overlap, so both pools count.
+        _MAX_VISIBLE_TASKS = cfg.download_workers + cfg.generate_workers
+
+        try:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+                task_id = progress.add_task("Starting…", total=len(tracks))
+
+                def on_progress(stage: str, current: int, total: int) -> None:
+                    label = {
+                        "beatsaver_search": "Searching BeatSaver",
+                        "beatsaver_download": "Downloading BeatSaver maps",
+                        "youtube_resolve": "Resolving YouTube URLs",
+                        "generate": "Generating maps",
+                    }.get(stage, stage)
+                    progress.update(task_id, description=label, completed=current, total=total or 1)
+
+                def on_batch_confirm(unmatched: list[Track]) -> list[Track]:
+                    progress.stop()
+                    _show_unmatched_table(unmatched)
+                    if not click.confirm(
+                        f"\nGenerate {len(unmatched)} maps locally from YouTube audio?",
+                        default=True,
+                    ):
+                        console.print("[yellow]Skipping local generation.[/yellow]")
+                        progress.start()
+                        return []
+                    progress.start()
+                    return unmatched
+
+                def on_url_review(
+                    resolutions: list[YouTubeResolution],
+                ) -> list[YouTubeResolution]:
+                    from smartsaber import _tui
+
+                    progress.stop()
+                    _show_url_review_table(resolutions)
+
+                    labels = [_resolution_choice_label(r) for r in resolutions]
+                    chosen_labels = _tui.checkbox(
+                        "Select tracks to override (space toggle, enter when done):",
+                        choices=labels,
+                    )
+
+                    # Map chosen labels back to indices
+                    label_to_idx = {lbl: i for i, lbl in enumerate(labels)}
+                    selected = [label_to_idx[lbl] for lbl in chosen_labels if lbl in label_to_idx]
+
+                    if selected:
+                        for idx in selected:
+                            r = resolutions[idx]
+                            new_url = _tui.text(
+                                f"YouTube URL for '{r.track.artist} \u2013 {r.track.title}'",
+                            )
+                            if new_url and new_url.strip():
+                                resolutions[idx] = YouTubeResolution(
+                                    track=r.track,
+                                    url=new_url.strip(),
+                                    duration_diff_s=0.0,
+                                    source="override",
+                                )
+                                console.print(f"  [green]✓[/green] Override set for '{r.track.title}'")
+
+                    progress.start()
+                    return resolutions
+
+                def on_track_stage(track: Track, stage: str) -> None:
+                    label = f"  [dim]{track.artist} – {track.title}[/dim]  [cyan]{stage}[/cyan]"
+                    with _track_tasks_lock:
+                        if track.source_id in _track_tasks:
+                            # Already has a spinner row — just update the label
+                            progress.update(_track_tasks[track.source_id], description=label)
+                        elif len(_track_tasks) < _MAX_VISIBLE_TASKS:
+                            # Room for a new spinner row
+                            tid = progress.add_task(label, total=None)
+                            _track_tasks[track.source_id] = tid
+                        # else: too many rows already visible, skip adding a new one
+
+                def on_track_complete(track: Track, result: GenerationResult) -> None:
+                    # Hide the per-track spinner row
+                    with _track_tasks_lock:
+                        tid = _track_tasks.pop(track.source_id, None)
+                        if tid is not None:
+                            progress.update(tid, visible=False)
+                    if result.success:
+                        status = "[green]✓[/green]"
+                        src = "BeatSaver" if result.was_beatsaver else "Generated"
+                    else:
+                        status = "[red]✗[/red]"
+                        src = f"Error: {result.error}"
+                    console.log(f"{status} {track.artist} – {track.title} [{src}]")
+
+                def on_error(track: Track, exc: Exception) -> None:
+                    console.log(f"[red]Error[/red] processing '{track.title}': {exc}")
+
+                result = pipeline_mod.run(
+                    tracks=tracks,
+                    config=cfg,
+                    playlist_info=playlist_info,
+                    on_progress=on_progress,
+                    on_batch_confirm=on_batch_confirm,
+                    on_url_review=on_url_review,
+                    on_track_complete=on_track_complete,
+                    on_track_stage=on_track_stage,
+                    on_error=on_error,
+                )
+
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Interrupted.[/yellow]")
+            os._exit(130)
 
     # --- Summary ---
     console.print()
@@ -432,6 +575,7 @@ def cmd_import(
 
 
 def _show_unmatched_table(tracks: list[Track]) -> None:
+    from rich.table import Table
     table = Table(title="Unmatched tracks (no BeatSaver community map found)")
     table.add_column("#", style="dim", width=4)
     table.add_column("Artist")
@@ -444,6 +588,7 @@ def _show_unmatched_table(tracks: list[Track]) -> None:
 
 
 def _show_url_review_table(resolutions: list["YouTubeResolution"]) -> None:
+    from rich.table import Table
     table = Table(title="Resolved YouTube URLs — review before generation")
     table.add_column("#", style="dim", width=4)
     table.add_column("Artist")
@@ -484,7 +629,8 @@ def _resolution_choice_label(r: "YouTubeResolution") -> str:
 
 def _pick_import_file() -> Optional[Path]:
     """Scan the ./import folder and let the user pick a file interactively."""
-    import questionary
+    from smartsaber import _tui
+    from smartsaber.fileimport import count_tracks
 
     import_dir = Path("import")
     if not import_dir.is_dir():
@@ -508,9 +654,19 @@ def _pick_import_file() -> Optional[Path]:
         )
         return None
 
-    choice = questionary.select(
-        "Which playlist would you like to import?",
-        choices=[questionary.Choice(title=p.name, value=p) for p in files],
-    ).ask()
+    # Build display labels with track counts
+    labels: list[str] = []
+    for p in files:
+        n = count_tracks(p)
+        label = f"{p.name}  ({n} track{'s' if n != 1 else ''})" if n > 0 else p.name
+        labels.append(label)
 
-    return choice  # None if user hits Ctrl+C
+    chosen = _tui.select(
+        "Which playlist would you like to import?",
+        choices=labels,
+    )
+    if chosen is None:
+        return None
+    # Map the chosen label back to the file path
+    idx = labels.index(chosen)
+    return files[idx]

@@ -48,6 +48,7 @@ def build_map(
     cover_url: Optional[str] = None,
     song_name_for_folder: str = "",
     artist_for_folder: str = "",
+    analysis_cache_key: str = "",
 ) -> Path:
     """
     Write all map files to a new folder under output_dir.
@@ -62,15 +63,30 @@ def build_map(
     dest.mkdir(parents=True, exist_ok=True)
 
     # Convert / copy audio → song.egg (OGG Vorbis)
+    # Skip if song.egg already exists and the source hasn't changed —
+    # this makes --regen nearly instant since audio doesn't need reconverting.
     egg_path = dest / "song.egg"
-    _convert_audio(audio_path, egg_path)
+    need_audio = True
+    if egg_path.exists() and egg_path.stat().st_size > 0:
+        # If the source IS the egg (e.g. regen pointing at the same folder),
+        # or if the egg is already up-to-date, skip conversion entirely.
+        try:
+            if audio_path.resolve() == egg_path.resolve():
+                need_audio = False
+            elif audio_path.stat().st_mtime <= egg_path.stat().st_mtime:
+                need_audio = False
+        except OSError:
+            pass  # stat failed — reconvert to be safe
+    if need_audio:
+        _convert_audio(audio_path, egg_path)
 
-    # Download cover art (fall back to a minimal valid JPEG if unavailable)
+    # Download cover art (skip if already exists, fall back to placeholder)
     cover_path = dest / "cover.jpg"
-    if cover_url:
-        _download_cover(cover_url, cover_path)
-    else:
-        _write_default_cover(cover_path)
+    if not cover_path.exists() or cover_path.stat().st_size == 0:
+        if cover_url:
+            _download_cover(cover_url, cover_path)
+        else:
+            _write_default_cover(cover_path)
 
     # Write difficulty .dat files
     written_diffs: list[MapDifficulty] = []
@@ -90,6 +106,12 @@ def build_map(
         json.dumps(_build_info_dat(info, written_diffs), indent=2),
         encoding="utf-8",
     )
+
+    # Persist the analysis cache key so --regen can find the original
+    # analysis without re-running librosa.  The key is the audio filename
+    # stem (e.g. "yt_dQw4w9WgXcQ") which maps to a file in ~/.smartsaber/analysis/.
+    if analysis_cache_key:
+        (dest / ".analysis_key").write_text(analysis_cache_key, encoding="utf-8")
 
     return dest
 
@@ -204,7 +226,7 @@ def _convert_audio(src: Path, dest: Path) -> None:
     If src is already OGG, just copy it.
     Requires ffmpeg on PATH.
     """
-    if src.suffix.lower() in (".ogg", ".oga"):
+    if src.suffix.lower() in (".ogg", ".oga", ".egg"):
         shutil.copy2(src, dest)
         return
 

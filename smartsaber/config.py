@@ -13,6 +13,11 @@ from dotenv import load_dotenv
 # Load .env from current dir (if present)
 load_dotenv()
 
+# Sensible default for CPU-bound workers — os.cpu_count() returns logical
+# cores (including hyperthreads).  Using all of them works well for the pure-
+# Python + librosa workload since NumPy releases the GIL internally.
+_DEFAULT_GEN_WORKERS = os.cpu_count() or 4
+
 
 @dataclass
 class SmartSaberConfig:
@@ -32,20 +37,24 @@ class SmartSaberConfig:
     # Generation
     skip_generate: bool = False
     skip_existing: bool = True
+    regen_only: bool = False       # regenerate notes for existing maps (no download)
     max_generate: int = 0          # 0 = unlimited
     difficulties: list[str] = field(
         default_factory=lambda: ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"]
     )
 
     # Worker pools (download is I/O-bound; generate is CPU-bound)
-    download_workers: int = 4      # parallel audio downloads
-    generate_workers: int = 2      # parallel map generators (analysis + note gen)
+    download_workers: int = 16      # parallel audio downloads (threads, I/O-bound)
+    generate_workers: int = _DEFAULT_GEN_WORKERS  # parallel map generators (processes, CPU-bound)
 
     # BeatSaver
     beatsaver_delay: float = 0.25  # seconds between requests
 
     # YouTube overrides: path to a JSON file mapping title/ID → YouTube URL
     overrides_file: Optional[Path] = None
+
+    # Debug mode — disables progress bars and prints detailed timing info
+    debug: bool = False
 
 
 def load_config() -> SmartSaberConfig:

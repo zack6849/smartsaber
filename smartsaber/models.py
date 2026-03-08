@@ -80,11 +80,23 @@ class BeatSaverMatch:
 class AudioAnalysis:
     tempo: float                       # BPM estimated by librosa
     beat_times: list[float]            # Seconds of each detected beat
-    onset_times: list[float]           # Seconds of each onset (quantized to beat grid)
+    onset_times: list[float]           # Merged onset times (perc + harm, quantized)
     rms_curve: list[float]             # Per-frame normalised RMS (0-1)
-    rms_times: list[float]             # Timestamps for rms_curve frames
+    rms_times: list[float]             # Timestamps for rms_curve / centroid frames
     segment_times: list[float]         # Structural segment boundaries (seconds)
     duration_s: float
+    # Per-stream onset sets (empty list if not yet computed)
+    perc_onset_times: list[float] = field(default_factory=list)  # drum / transient onsets
+    harm_onset_times: list[float] = field(default_factory=list)  # melodic / harmonic onsets
+    # Spectral centroid normalised to [0,1] per song (0=bass, 1=treble/vocals).
+    # Same frame timestamps as rms_times.  Empty list if not yet computed.
+    spectral_centroid_curve: list[float] = field(default_factory=list)
+    # Per-frame band energy ratios — three lists (bass/mid/treble), same timestamps
+    # as rms_times.  Each value is the fraction of total energy in that band for
+    # that frame (sums to ~1.0).  Empty lists if not yet computed.
+    bass_energy_curve: list[float] = field(default_factory=list)
+    mid_energy_curve: list[float] = field(default_factory=list)
+    treble_energy_curve: list[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

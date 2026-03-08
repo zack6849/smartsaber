@@ -23,6 +23,31 @@ def load_tracks(path: Path) -> list[Track]:
     raise ValueError(f"Unsupported file type '{suffix}'. Use .csv (Exportify) or .json.")
 
 
+def count_tracks(path: Path) -> int:
+    """Quickly count the number of tracks in a file without fully parsing.
+
+    For CSV: counts non-empty data rows (subtracts the header).
+    For JSON: counts items in the top-level list.
+    Returns 0 on any error.
+    """
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            with path.open(newline="", encoding="utf-8-sig") as f:
+                # Count rows with at least one non-empty field, minus the header
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if header is None:
+                    return 0
+                return sum(1 for row in reader if any(cell.strip() for cell in row))
+        if suffix == ".json":
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return len(data) if isinstance(data, list) else 0
+    except Exception:
+        return 0
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Exportify CSV
 # ---------------------------------------------------------------------------

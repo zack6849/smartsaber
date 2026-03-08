@@ -18,7 +18,6 @@ dependencies = [
     "soundfile>=0.12.0",
     "pydub>=0.25.0",
     "Pillow>=9.0.0",
-    "questionary>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +31,17 @@ smartsaber = "smartsaber.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["smartsaber*"]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # audioread imports stdlib modules removed in Python 3.13 — nothing we
+    # can do until librosa drops the audioread dependency.
+    "ignore::DeprecationWarning:audioread",
+    # librosa's internal audioread fallback is deprecated; harmless on 3.12.
+    "ignore:librosa.core.audio.__audioread_load:FutureWarning",
+    # PySoundFile can't decode our tiny test .egg stubs — expected.
+    "ignore:PySoundFile failed:UserWarning",
+]
 
 [build-system]
 requires = ["setuptools>=42"]

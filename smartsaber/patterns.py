@@ -19,6 +19,9 @@ FLOW_MAP: dict[CutDirection, list[CutDirection]] = {
         CutDirection.DOWN_RIGHT,
         CutDirection.UP_LEFT,
         CutDirection.UP_RIGHT,
+        CutDirection.LEFT,
+        CutDirection.RIGHT,
+        CutDirection.DOT,
     ],
     CutDirection.DOWN: [
         CutDirection.UP,
@@ -26,38 +29,55 @@ FLOW_MAP: dict[CutDirection, list[CutDirection]] = {
         CutDirection.UP_RIGHT,
         CutDirection.DOWN_LEFT,
         CutDirection.DOWN_RIGHT,
+        CutDirection.LEFT,
+        CutDirection.RIGHT,
+        CutDirection.DOT,
     ],
     CutDirection.LEFT: [
         CutDirection.RIGHT,
         CutDirection.UP_RIGHT,
         CutDirection.DOWN_RIGHT,
+        CutDirection.UP,
+        CutDirection.DOWN,
+        CutDirection.DOT,
     ],
     CutDirection.RIGHT: [
         CutDirection.LEFT,
         CutDirection.UP_LEFT,
         CutDirection.DOWN_LEFT,
+        CutDirection.UP,
+        CutDirection.DOWN,
+        CutDirection.DOT,
     ],
     CutDirection.UP_LEFT: [
         CutDirection.DOWN,
         CutDirection.DOWN_RIGHT,
         CutDirection.DOWN_LEFT,
         CutDirection.UP,
+        CutDirection.RIGHT,
+        CutDirection.DOT,
     ],
     CutDirection.UP_RIGHT: [
         CutDirection.DOWN,
         CutDirection.DOWN_LEFT,
         CutDirection.DOWN_RIGHT,
         CutDirection.UP,
+        CutDirection.LEFT,
+        CutDirection.DOT,
     ],
     CutDirection.DOWN_LEFT: [
         CutDirection.UP,
         CutDirection.UP_RIGHT,
         CutDirection.DOWN,
+        CutDirection.RIGHT,
+        CutDirection.DOT,
     ],
     CutDirection.DOWN_RIGHT: [
         CutDirection.UP,
         CutDirection.UP_LEFT,
         CutDirection.DOWN,
+        CutDirection.LEFT,
+        CutDirection.DOT,
     ],
     CutDirection.DOT: list(CutDirection),
 }
@@ -85,7 +105,9 @@ def next_direction(prev: CutDirection, preferred: Optional[list[CutDirection]] =
 # ---------------------------------------------------------------------------
 # Grid is 4 wide × 3 tall.  line_index 0=left…3=right, line_layer 0=bot…2=top.
 
-# Comfortable column transitions for each hand given the previous column
+# Comfortable column transitions for each hand given the previous column.
+# Center columns (1, 2) are always reachable; outer columns (0, 3) only
+# from adjacent positions.
 _COL_REACH: dict[int, list[int]] = {
     0: [0, 1, 2],
     1: [0, 1, 2, 3],
@@ -93,11 +115,13 @@ _COL_REACH: dict[int, list[int]] = {
     3: [1, 2, 3],
 }
 
-# Comfortable row transitions from the previous row
+# Comfortable row transitions — only adjacent rows.  Jumping bottom→top
+# (row 0→2) in a single beat forces a huge arm motion that's uncomfortable
+# at speed.  The player should move through row 1 to get from 0→2.
 _ROW_REACH: dict[int, list[int]] = {
-    0: [0, 1, 2],
+    0: [0, 1],
     1: [0, 1, 2],
-    2: [0, 1, 2],
+    2: [1, 2],
 }
 
 

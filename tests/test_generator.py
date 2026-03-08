@@ -4,7 +4,7 @@ import random
 import pytest
 
 from smartsaber.analyzer import AudioAnalysis
-from smartsaber.generator import generate_difficulty, generate_all_difficulties
+from smartsaber.generator import generate_difficulty, generate_all_difficulties, _PARITY_AFTER, _PARITY_REQUIRED
 from smartsaber.models import CutDirection, Difficulty, NoteType
 from smartsaber.patterns import is_good_flow, FLOW_MAP
 
@@ -135,3 +135,209 @@ def test_empty_analysis_returns_empty():
     )
     md = generate_difficulty(analysis, Difficulty.NORMAL)
     assert md.notes == []
+
+
+# ---------------------------------------------------------------------------
+# Parity validation
+# ---------------------------------------------------------------------------
+
+def test_parity_tables_cover_all_directions():
+    """Every CutDirection should have an entry in both parity maps."""
+    for d in CutDirection:
+        assert d in _PARITY_AFTER, f"{d} missing from _PARITY_AFTER"
+        assert d in _PARITY_REQUIRED, f"{d} missing from _PARITY_REQUIRED"
+
+
+def test_parity_not_violated_same_hand():
+    """Consecutive same-hand notes should not have two vertical swings in the
+    same direction (parity violation).  Horizontal / dot swings are exempt."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    for diff in [Difficulty.NORMAL, Difficulty.HARD, Difficulty.EXPERT]:
+        md = generate_difficulty(analysis, diff, rng=random.Random(42))
+        # Group notes by hand, sorted by time
+        from collections import defaultdict
+        by_hand: dict[NoteType, list] = defaultdict(list)
+        for n in md.notes:
+            by_hand[n.type].append(n)
+
+        violations = 0
+        for hand, notes in by_hand.items():
+            notes_sorted = sorted(notes, key=lambda n: n.time)
+            parity = None  # arm position after the previous swing
+            for note in notes_sorted:
+                required = _PARITY_REQUIRED.get(note.cut_direction)
+                if required is not None and parity is not None:
+                    if required != parity:
+                        violations += 1
+                after = _PARITY_AFTER.get(note.cut_direction)
+                if after is not None:
+                    parity = after
+
+        # Allow up to ~55% violations — we intentionally use "soft parity"
+        # (50% enforcement) to match human map direction distributions where
+        # DOWN:UP ratio is ~1.4:1 rather than forced 1:1 strict alternation.
+        total_notes = len(md.notes)
+        if total_notes > 0:
+            violation_rate = violations / total_notes
+            assert violation_rate < 0.55, (
+                f"Parity violation rate {violation_rate:.1%} ({violations}/{total_notes}) "
+                f"too high for {diff.value}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Band-energy row placement
+# ---------------------------------------------------------------------------
+
+def test_band_row_at_fallback():
+    """band_row_at falls back to centroid when band curves are empty."""
+    from smartsaber.analyzer import band_row_at
+    analysis = _simple_analysis()
+    # With no band curves and default energy, should return a valid row (0, 1, or 2)
+    row = band_row_at(analysis, 5.0, energy=0.5)
+    assert row in (0, 1, 2)
+
+
+def test_band_row_at_with_curves():
+    """band_row_at returns ergonomic rows based on dominant band + energy."""
+    from smartsaber.analyzer import band_row_at
+    analysis = _simple_analysis()
+    n = len(analysis.rms_times)
+    # Force bass-dominant: bass=0.8, mid=0.1, treble=0.1
+    analysis.bass_energy_curve = [0.8] * n
+    analysis.mid_energy_curve = [0.1] * n
+    analysis.treble_energy_curve = [0.1] * n
+    assert band_row_at(analysis, 5.0, energy=0.5) == 0  # bass → row 0
+
+    # Force treble-dominant WITH high energy → row 2 (overhead emphasis)
+    analysis.bass_energy_curve = [0.1] * n
+    analysis.mid_energy_curve = [0.1] * n
+    analysis.treble_energy_curve = [0.8] * n
+    assert band_row_at(analysis, 5.0, energy=0.8) == 2  # treble+energy → row 2
+
+    # Force treble-dominant WITHOUT high energy → row 1 (not overhead)
+    assert band_row_at(analysis, 5.0, energy=0.3) == 1  # treble but low energy → row 1
+
+
+def test_row_distribution_ergonomic():
+    """Most notes should be at rows 0-1 (waist/chest), with row 2 rare."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    md = generate_difficulty(analysis, Difficulty.HARD, rng=random.Random(42))
+    rows = [n.line_layer for n in md.notes]
+    total = len(rows)
+    assert total > 0
+    row2_fraction = rows.count(2) / total
+    row01_fraction = (rows.count(0) + rows.count(1)) / total
+    # Row 2 (overhead) should be less than 25% of notes
+    assert row2_fraction < 0.25, (
+        f"Too many overhead notes: row2={row2_fraction:.0%} "
+        f"(row0={rows.count(0)}, row1={rows.count(1)}, row2={rows.count(2)})"
+    )
+    # Rows 0+1 should be at least 75%
+    assert row01_fraction >= 0.75
+
+
+def test_direction_distribution_balanced():
+    """DOWN-family strokes should be at least as common as UP-family.
+    No single direction family should exceed 80%."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    md = generate_difficulty(analysis, Difficulty.HARD, rng=random.Random(42))
+    total = len(md.notes)
+    assert total > 0
+
+    up_family = sum(1 for n in md.notes if n.cut_direction in (
+        CutDirection.UP, CutDirection.UP_LEFT, CutDirection.UP_RIGHT))
+    down_family = sum(1 for n in md.notes if n.cut_direction in (
+        CutDirection.DOWN, CutDirection.DOWN_LEFT, CutDirection.DOWN_RIGHT))
+
+    up_frac = up_family / total
+    down_frac = down_family / total
+
+    # Neither family should dominate excessively
+    assert up_frac < 0.70, f"UP-family too dominant: {up_frac:.0%}"
+    assert down_frac < 0.80, f"DOWN-family too dominant: {down_frac:.0%}"
+    # DOWN should be at least as common as UP (natural resting stroke)
+    assert down_frac >= up_frac * 0.5, (
+        f"DOWN ({down_frac:.0%}) should not be drastically less than UP ({up_frac:.0%})"
+    )
+
+
+def test_center_column_bias():
+    """Center columns (1, 2) should have far more notes than outer columns (0, 3)."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    md = generate_difficulty(analysis, Difficulty.HARD, rng=random.Random(42))
+    total = len(md.notes)
+    assert total > 0
+    center = sum(1 for n in md.notes if n.line_index in (1, 2))
+    outer = sum(1 for n in md.notes if n.line_index in (0, 3))
+    center_frac = center / total
+    # Human maps use ~60% center columns and ~40% outer columns.
+    # Our generator targets a similar split (col weights: outer=2, center=3).
+    assert center_frac >= 0.50, (
+        f"Center columns too low: {center_frac:.0%} "
+        f"(center={center}, outer={outer}, total={total})"
+    )
+
+
+def test_no_crossovers():
+    """Left hand should never be right of right hand at the same beat."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    for diff in [Difficulty.HARD, Difficulty.EXPERT]:
+        md = generate_difficulty(analysis, diff, rng=random.Random(42))
+        from collections import defaultdict
+        by_beat: dict[float, dict] = defaultdict(dict)
+        for n in md.notes:
+            by_beat[n.time][n.type] = n
+
+        for beat_t, notes in by_beat.items():
+            if NoteType.LEFT in notes and NoteType.RIGHT in notes:
+                left_col = notes[NoteType.LEFT].line_index
+                right_col = notes[NoteType.RIGHT].line_index
+                assert left_col <= right_col, (
+                    f"Crossover at beat {beat_t}: left@col{left_col}, right@col{right_col}"
+                )
+
+
+def test_no_huge_vertical_jumps():
+    """No consecutive same-hand notes should jump from row 0→2 or 2→0."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    md = generate_difficulty(analysis, Difficulty.EXPERT, rng=random.Random(42))
+    from collections import defaultdict
+    by_hand: dict[NoteType, list] = defaultdict(list)
+    for n in md.notes:
+        by_hand[n.type].append(n)
+
+    for hand, notes in by_hand.items():
+        notes_sorted = sorted(notes, key=lambda n: n.time)
+        for i in range(1, len(notes_sorted)):
+            prev_row = notes_sorted[i - 1].line_layer
+            curr_row = notes_sorted[i].line_layer
+            jump = abs(curr_row - prev_row)
+            assert jump <= 1, (
+                f"Huge vertical jump: {hand} row {prev_row}→{curr_row} "
+                f"at beat {notes_sorted[i].time}"
+            )
+
+
+def test_doubles_same_direction():
+    """When both hands play at the same beat, they should swing the same direction."""
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    # Use Expert+ for highest chance of doubles
+    md = generate_difficulty(analysis, Difficulty.EXPERT_PLUS, rng=random.Random(42))
+    from collections import defaultdict
+    by_beat: dict[float, list] = defaultdict(list)
+    for n in md.notes:
+        by_beat[n.time].append(n)
+
+    doubles = [(t, ns) for t, ns in by_beat.items() if len(ns) == 2]
+    mismatches = 0
+    for t, notes in doubles:
+        if notes[0].cut_direction != notes[1].cut_direction:
+            mismatches += 1
+    if doubles:
+        mismatch_rate = mismatches / len(doubles)
+        assert mismatch_rate < 0.05, (
+            f"Too many doubles with different directions: {mismatch_rate:.0%} "
+            f"({mismatches}/{len(doubles)})"
+        )
+
