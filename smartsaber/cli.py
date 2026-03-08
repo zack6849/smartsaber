@@ -226,6 +226,12 @@ def cmd_import(
         cfg.overrides_file = overrides
 
     # --- Load tracks ---
+    # No args at all — offer a file picker from the import/ folder
+    if not from_file and not url:
+        from_file = _pick_import_file()
+        if from_file is None:
+            sys.exit(1)
+
     if from_file:
         from smartsaber.fileimport import load_tracks
         from smartsaber.models import PlaylistInfo as _PlaylistInfo
@@ -261,12 +267,6 @@ def cmd_import(
             sys.exit(1)
 
         console.print(f"[bold]{playlist_info.name}[/bold] — {len(tracks)} tracks")
-    else:
-        err_console.print(
-            "[red]Provide a Spotify URL or use --from-file.[/red]\n"
-            "Example: smartsaber import --from-file playlist.csv"
-        )
-        sys.exit(1)
 
     if dry_run:
         console.print("\n[yellow]Dry-run mode — no files will be written.[/yellow]\n")
@@ -437,3 +437,37 @@ def _resolution_choice_label(r: "YouTubeResolution") -> str:
     if r.url:
         base += f"  {r.url[:60]}{'…' if len(r.url) > 60 else ''}"
     return base
+
+
+def _pick_import_file() -> Optional[Path]:
+    """Scan the ./import folder and let the user pick a file interactively."""
+    import questionary
+
+    import_dir = Path("import")
+    if not import_dir.is_dir():
+        err_console.print(
+            "[red]No import/ folder found and no file or URL provided.[/red]\n"
+            "Create an import/ folder and drop your Exportify CSV files in it,\n"
+            "or pass a file directly with --from-file."
+        )
+        return None
+
+    files = sorted(
+        p for p in import_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in (".csv", ".json")
+    )
+
+    if not files:
+        err_console.print(
+            "[red]No CSV or JSON files found in import/.[/red]\n"
+            "Export your playlist at exportify.net, save it to the import/ folder,\n"
+            "then run [bold]smartsaber import[/bold] again."
+        )
+        return None
+
+    choice = questionary.select(
+        "Which playlist would you like to import?",
+        choices=[questionary.Choice(title=p.name, value=p) for p in files],
+    ).ask()
+
+    return choice  # None if user hits Ctrl+C

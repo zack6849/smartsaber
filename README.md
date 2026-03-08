@@ -127,7 +127,13 @@ smartsaber import https://open.spotify.com/playlist/YOUR_PLAYLIST_ID
 
 ### Import from an Exportify CSV (no API needed)
 
-Export your playlist at [exportify.net](https://exportify.net), then:
+Export your playlist at [exportify.net](https://exportify.net) and drop the file into the `import/` folder, then run with no arguments:
+
+```bash
+smartsaber import
+```
+
+SmartSaber will show a list of files in `import/` and let you pick one. You can also point directly at any file:
 
 ```bash
 smartsaber import --from-file my_playlist.csv
