@@ -43,8 +43,14 @@ class DiffParams:
     onset_density: float
     # Allow doubles (both hands at the same time)
     allow_doubles: bool
-    # Minimum RMS energy to place a double
+    # Minimum RMS energy to place a double.
+    # Corpus analysis (500 maps): doubles appear at RMS ~0.64-0.67, singles at
+    # ~0.57-0.63.  Threshold sits just above the singles mean so doubles only
+    # fire during genuinely elevated passages.
     double_energy_threshold: float
+    # Probability that a crossover is attempted when energy is sufficient.
+    # Corpus: crossovers are 5% of Easy notes → 24% of ExpertPlus notes.
+    crossover_chance: float
 
 
 # Absolute minimum gap in seconds — no note can follow another faster than this
@@ -58,30 +64,38 @@ _DIFF_PARAMS: dict[Difficulty, DiffParams] = {
         onset_density=0.35,
         allow_doubles=False,
         double_energy_threshold=1.0,
+        crossover_chance=0.0,     # no crossovers at beginner level
     ),
     Difficulty.NORMAL: DiffParams(
         min_gap_beats=1.0,        # quarter note minimum
         onset_density=0.5,
         allow_doubles=False,
         double_energy_threshold=1.0,
+        crossover_chance=0.0,
     ),
     Difficulty.HARD: DiffParams(
         min_gap_beats=0.5,        # 8th note minimum
         onset_density=0.7,
         allow_doubles=True,
-        double_energy_threshold=0.75,
+        # Corpus: Hard doubles rms=0.654, singles rms=0.603 — threshold midpoint
+        double_energy_threshold=0.63,
+        crossover_chance=0.04,    # rare crossovers start appearing at Hard
     ),
     Difficulty.EXPERT: DiffParams(
         min_gap_beats=0.333,      # triplet (3 notes per beat)
         onset_density=0.85,
         allow_doubles=True,
-        double_energy_threshold=0.6,
+        # Corpus: Expert doubles rms=0.648, singles rms=0.585
+        double_energy_threshold=0.60,
+        crossover_chance=0.12,    # ~12% — corpus shows ~20% of Expert notes are crossovers
     ),
     Difficulty.EXPERT_PLUS: DiffParams(
         min_gap_beats=0.25,       # 16th note minimum
         onset_density=1.0,
         allow_doubles=True,
-        double_energy_threshold=0.5,
+        # Corpus: ExpertPlus doubles rms=0.641, singles rms=0.571
+        double_energy_threshold=0.58,
+        crossover_chance=0.20,    # corpus shows ~24% of ExpertPlus notes are crossovers
     ),
 }
 
@@ -190,10 +204,30 @@ def generate_difficulty(
             continue  # vision rule: no stacked notes on same beat
 
         # --- Double placement ---
-        place_double = (
-            params.allow_doubles
-            and energy >= params.double_energy_threshold
-            and rng.random() < 0.2  # 20% chance when energy is sufficient
+        # Probability scales with how far energy exceeds the threshold.
+        # Corpus: doubles occur at +0.04 to +0.07 RMS above singles, and the
+        # gap grows with difficulty — so higher-difficulty doubles feel more
+        # "earned" by the music.  At threshold energy: 15% chance.  At max: 40%.
+        if params.allow_doubles and energy >= params.double_energy_threshold:
+            energy_excess = min(
+                (energy - params.double_energy_threshold)
+                / max(1.0 - params.double_energy_threshold, 0.01),
+                1.0,
+            )
+            double_prob = 0.15 + 0.25 * energy_excess
+        else:
+            double_prob = 0.0
+        place_double = double_prob > 0 and rng.random() < double_prob
+
+        # --- Crossover flag ---
+        # Passed into _place_note so it can allow the hand to cross over the
+        # other hand's column.  Only triggered at higher difficulties and only
+        # on single notes (doubles in crossover positions are disorienting).
+        allow_crossover = (
+            not place_double
+            and params.crossover_chance > 0
+            and energy >= 0.55  # corpus: crossovers appear at moderate+ energy
+            and rng.random() < params.crossover_chance
         )
 
         centroid = centroid_at(analysis, onset_t)
@@ -202,8 +236,8 @@ def generate_difficulty(
         preferred_row = band_row_at(analysis, onset_t, energy=energy)
 
         if place_double:
-            left_note = _place_note(NoteType.LEFT, beat_t, onset_t, energy, centroid, preferred_row, hands, min_gap_s, rng)
-            right_note = _place_note(NoteType.RIGHT, beat_t, onset_t, energy, centroid, preferred_row, hands, min_gap_s, rng)
+            left_note = _place_note(NoteType.LEFT, beat_t, onset_t, energy, centroid, preferred_row, hands, min_gap_s, rng, allow_crossover=False)
+            right_note = _place_note(NoteType.RIGHT, beat_t, onset_t, energy, centroid, preferred_row, hands, min_gap_s, rng, allow_crossover=False)
             # For doubles, force same direction (parallel swing) — much more
             # comfortable than random independent directions.
             if left_note and right_note:
@@ -229,7 +263,7 @@ def generate_difficulty(
                 md.notes.append(left_note)
                 pending_beat_times.add(beat_t)
         else:
-            note = _place_note(current_hand, beat_t, onset_t, energy, centroid, preferred_row, hands, min_gap_s, rng)
+            note = _place_note(current_hand, beat_t, onset_t, energy, centroid, preferred_row, hands, min_gap_s, rng, allow_crossover=allow_crossover)
             if note:
                 md.notes.append(note)
                 pending_beat_times.add(beat_t)
@@ -307,6 +341,7 @@ def _place_note(
     hands: dict[NoteType, HandState],
     min_gap_s: float,
     rng: random.Random,
+    allow_crossover: bool = False,
 ) -> Optional[Note]:
     """Place a single note for the given hand, respecting flow, parity, and reachability.
 
@@ -329,18 +364,31 @@ def _place_note(
     # 1. Pick position — reachable from last note, filtered by hand zone
     positions = reachable_positions(state.last_col, state.last_row)
 
-    # --- Hand zones + crossover prevention ---
-    # Left hand: cols 0-1 preferred, col 2 allowed.  Must not be right of the
-    # right hand's last column (crossover = arms tangled).
-    # Right hand: cols 2-3 preferred, col 1 allowed.  Must not be left of left hand.
+    # --- Hand zones + crossover control ---
+    # Normal: left stays left of right hand, right stays right of left hand.
+    # Crossover: the crossing hand is pushed *past* the other hand's column —
+    # left goes to col 2-3, right goes to col 0-1.  This matches the ~24% of
+    # ExpertPlus notes that cross the center line in well-made human maps.
     if hand == NoteType.LEFT:
-        max_col = min(2, other_state.last_col)  # can't go right of right hand
-        strict = [(c, r) for c, r in positions if c <= 1 and c <= max_col]
-        positions = strict or [(c, r) for c, r in positions if c <= max_col] or positions
+        if allow_crossover:
+            # Cross over: left hand goes right of the other hand
+            cross_col = other_state.last_col + 1
+            strict = [(c, r) for c, r in positions if c >= cross_col and c <= 3]
+            positions = strict or [(c, r) for c, r in positions if c >= 2] or positions
+        else:
+            max_col = min(2, other_state.last_col)  # can't go right of right hand
+            strict = [(c, r) for c, r in positions if c <= 1 and c <= max_col]
+            positions = strict or [(c, r) for c, r in positions if c <= max_col] or positions
     else:
-        min_col = max(1, other_state.last_col)  # can't go left of left hand
-        strict = [(c, r) for c, r in positions if c >= 2 and c >= min_col]
-        positions = strict or [(c, r) for c, r in positions if c >= min_col] or positions
+        if allow_crossover:
+            # Cross over: right hand goes left of the other hand
+            cross_col = other_state.last_col - 1
+            strict = [(c, r) for c, r in positions if c <= cross_col and c >= 0]
+            positions = strict or [(c, r) for c, r in positions if c <= 1] or positions
+        else:
+            min_col = max(1, other_state.last_col)  # can't go left of left hand
+            strict = [(c, r) for c, r in positions if c >= 2 and c >= min_col]
+            positions = strict or [(c, r) for c, r in positions if c >= min_col] or positions
 
     # Row preference: human-made maps place ~75% of notes at waist (row 0),
     # ~20% at chest (row 1), and only ~5% overhead (row 2).  We use the

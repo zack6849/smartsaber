@@ -298,8 +298,9 @@ def band_row_at(analysis: AudioAnalysis, time_s: float, energy: float = 0.5) -> 
         if bass >= mid and bass >= treble:
             return 0
 
-        # Treble-dominant AND high energy → row 2 (overhead for emphasis)
-        if treble >= mid and treble >= bass and energy >= 0.7:
+        # Treble-dominant AND high energy → row 2 (overhead for emphasis).
+        # Corpus analysis: row 2 appears at mean RMS ~0.635+ across difficulties.
+        if treble >= mid and treble >= bass and energy >= 0.65:
             return 2
 
         # Treble-dominant but not enough energy → row 1 (don't force overhead)
