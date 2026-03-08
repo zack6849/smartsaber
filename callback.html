@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SmartSaber — Spotify Auth</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 600px;
+      margin: 60px auto;
+      padding: 0 20px;
+      background: #121212;
+      color: #fff;
+    }
+    h1 { color: #1db954; }
+    #code-box {
+      width: 100%;
+      padding: 12px;
+      font-family: monospace;
+      font-size: 14px;
+      background: #282828;
+      color: #fff;
+      border: 1px solid #535353;
+      border-radius: 6px;
+      box-sizing: border-box;
+      margin-top: 12px;
+      cursor: text;
+    }
+    button {
+      margin-top: 10px;
+      padding: 10px 20px;
+      background: #1db954;
+      color: #000;
+      border: none;
+      border-radius: 20px;
+      font-weight: bold;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:active { background: #17a349; }
+    .error { color: #f15e6c; }
+    p { color: #b3b3b3; }
+  </style>
+</head>
+<body>
+  <h1>SmartSaber</h1>
+  <div id="content"></div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const error = params.get('error');
+    const content = document.getElementById('content');
+
+    if (code) {
+      content.innerHTML = `
+        <p>Auth approved! Copy the code below and paste it into your terminal.</p>
+        <textarea id="code-box" rows="4" readonly>${code}</textarea>
+        <br>
+        <button onclick="copyCode()">Copy Code</button>
+        <p style="font-size:12px;margin-top:16px;">You can close this tab once copied.</p>
+      `;
+      // Auto-select on load
+      document.getElementById('code-box').select();
+    } else if (error) {
+      content.innerHTML = `
+        <p class="error">Authorization failed: <strong>${error}</strong></p>
+        <p>Close this tab and try running <code>smartsaber login</code> again.</p>
+      `;
+    } else {
+      content.innerHTML = `
+        <p class="error">No auth code found in this URL.</p>
+        <p>This page should only be opened via the Spotify auth redirect.</p>
+      `;
+    }
+
+    function copyCode() {
+      const box = document.getElementById('code-box');
+      box.select();
+      document.execCommand('copy');
+      event.target.textContent = 'Copied!';
+      setTimeout(() => event.target.textContent = 'Copy Code', 2000);
+    }
+  </script>
+</body>
+</html>

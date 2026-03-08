@@ -1,0 +1,29 @@
+# Secrets & credentials
+.env
+.cache
+
+# Virtual environment
+.venv
+
+# Python build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Test & tool caches
+.pytest_cache/
+
+# Local output
+output/
+
+# Personal playlist exports (CSV/JSON) — don't commit your own data
+*.csv
+*.json
+
+# Editor
+.idea/
+smartsaber/.idea
+
+# Claude Code
+.claude
