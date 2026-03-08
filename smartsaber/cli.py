@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -155,9 +156,9 @@ def cmd_login() -> None:
     help="Limit number of locally generated maps (0 = unlimited)",
 )
 @click.option(
-    "--keep-audio",
+    "--no-keep-audio",
     is_flag=True, default=False,
-    help="Keep downloaded audio files after processing",
+    help="Delete downloaded audio files after processing (default: keep them)",
 )
 @click.option(
     "--overrides",
@@ -168,6 +169,16 @@ def cmd_login() -> None:
         "Use this to force a specific video for a track. "
         'Example: {"Get Back": "https://youtube.com/watch?v=..."}'
     ),
+)
+@click.option(
+    "--download-workers",
+    default=None, type=int,
+    help="Parallel audio download threads — I/O bound, can be high (default: 4)",
+)
+@click.option(
+    "--generate-workers", "-w",
+    default=None, type=int,
+    help="Parallel map generation threads — CPU bound (default: 2)",
 )
 @click.option(
     "--verbose", "-v",
@@ -186,8 +197,10 @@ def cmd_import(
     skip_existing: bool,
     dry_run: bool,
     max_generate: int,
-    keep_audio: bool,
+    no_keep_audio: bool,
     overrides: Optional[Path],
+    download_workers: Optional[int],
+    generate_workers: Optional[int],
     verbose: bool,
 ) -> None:
     """Import a Spotify playlist into Beat Saber custom maps.
@@ -221,9 +234,14 @@ def cmd_import(
     cfg.skip_generate = skip_generate
     cfg.skip_existing = skip_existing
     cfg.max_generate = max_generate
-    cfg.keep_audio = keep_audio
+    if no_keep_audio:
+        cfg.keep_audio = False
     if overrides:
         cfg.overrides_file = overrides
+    if download_workers is not None:
+        cfg.download_workers = max(1, download_workers)
+    if generate_workers is not None:
+        cfg.generate_workers = max(1, generate_workers)
 
     # --- Load tracks ---
     # No args at all — offer a file picker from the import/ folder
@@ -275,100 +293,124 @@ def cmd_import(
         return
 
     # --- Run pipeline with Rich callbacks ---
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-        transient=True,
-    ) as progress:
-        task_id = progress.add_task("Starting…", total=len(tracks))
+    import threading as _threading
+    _track_tasks: dict[str, int] = {}   # source_id → Rich task ID
+    _track_tasks_lock = _threading.Lock()
 
-        def on_progress(stage: str, current: int, total: int) -> None:
-            label = {
-                "beatsaver_search": "Searching BeatSaver",
-                "beatsaver_download": "Downloading BeatSaver maps",
-                "youtube_resolve": "Resolving YouTube URLs",
-                "generate": "Generating maps",
-            }.get(stage, stage)
-            progress.update(task_id, description=label, completed=current, total=total or 1)
+    try:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task_id = progress.add_task("Starting…", total=len(tracks))
 
-        def on_batch_confirm(unmatched: list[Track]) -> list[Track]:
-            progress.stop()
-            _show_unmatched_table(unmatched)
-            if not click.confirm(
-                f"\nGenerate {len(unmatched)} maps locally from YouTube audio?",
-                default=True,
-            ):
-                console.print("[yellow]Skipping local generation.[/yellow]")
+            def on_progress(stage: str, current: int, total: int) -> None:
+                label = {
+                    "beatsaver_search": "Searching BeatSaver",
+                    "beatsaver_download": "Downloading BeatSaver maps",
+                    "youtube_resolve": "Resolving YouTube URLs",
+                    "generate": "Generating maps",
+                }.get(stage, stage)
+                progress.update(task_id, description=label, completed=current, total=total or 1)
+
+            def on_batch_confirm(unmatched: list[Track]) -> list[Track]:
+                progress.stop()
+                _show_unmatched_table(unmatched)
+                if not click.confirm(
+                    f"\nGenerate {len(unmatched)} maps locally from YouTube audio?",
+                    default=True,
+                ):
+                    console.print("[yellow]Skipping local generation.[/yellow]")
+                    progress.start()
+                    return []
                 progress.start()
-                return []
-            progress.start()
-            return unmatched
+                return unmatched
 
-        def on_url_review(
-            resolutions: list[YouTubeResolution],
-        ) -> list[YouTubeResolution]:
-            import questionary
+            def on_url_review(
+                resolutions: list[YouTubeResolution],
+            ) -> list[YouTubeResolution]:
+                import questionary
 
-            progress.stop()
-            _show_url_review_table(resolutions)
+                progress.stop()
+                _show_url_review_table(resolutions)
 
-            choices = [
-                questionary.Choice(
-                    title=_resolution_choice_label(r),
-                    value=i,
-                )
-                for i, r in enumerate(resolutions)
-            ]
+                choices = [
+                    questionary.Choice(
+                        title=_resolution_choice_label(r),
+                        value=i,
+                    )
+                    for i, r in enumerate(resolutions)
+                ]
 
-            selected = questionary.checkbox(
-                "Select tracks to override (↑↓ navigate, space select, enter when done):",
-                choices=choices,
-            ).ask()  # returns None if the user hits Ctrl+C
+                selected = questionary.checkbox(
+                    "Select tracks to override (↑↓ navigate, space select, enter when done):",
+                    choices=choices,
+                ).ask()  # returns None if the user hits Ctrl+C
 
-            if selected:
-                for idx in selected:
-                    r = resolutions[idx]
-                    new_url = questionary.text(
-                        f"YouTube URL for '{r.track.artist} – {r.track.title}':",
-                    ).ask()
-                    if new_url and new_url.strip():
-                        resolutions[idx] = YouTubeResolution(
-                            track=r.track,
-                            url=new_url.strip(),
-                            duration_diff_s=0.0,
-                            source="override",
-                        )
-                        console.print(f"  [green]✓[/green] Override set for '{r.track.title}'")
+                if selected:
+                    for idx in selected:
+                        r = resolutions[idx]
+                        new_url = questionary.text(
+                            f"YouTube URL for '{r.track.artist} – {r.track.title}':",
+                        ).ask()
+                        if new_url and new_url.strip():
+                            resolutions[idx] = YouTubeResolution(
+                                track=r.track,
+                                url=new_url.strip(),
+                                duration_diff_s=0.0,
+                                source="override",
+                            )
+                            console.print(f"  [green]✓[/green] Override set for '{r.track.title}'")
 
-            progress.start()
-            return resolutions
+                progress.start()
+                return resolutions
 
-        def on_track_complete(track: Track, result: GenerationResult) -> None:
-            if result.success:
-                status = "[green]✓[/green]"
-                src = "BeatSaver" if result.was_beatsaver else "Generated"
-            else:
-                status = "[red]✗[/red]"
-                src = f"Error: {result.error}"
-            console.log(f"{status} {track.artist} – {track.title} [{src}]")
+            def on_track_stage(track: Track, stage: str) -> None:
+                label = f"  [dim]{track.artist} – {track.title}[/dim]  [cyan]{stage}[/cyan]"
+                with _track_tasks_lock:
+                    if track.source_id not in _track_tasks:
+                        tid = progress.add_task(label, total=None)
+                        _track_tasks[track.source_id] = tid
+                    else:
+                        progress.update(_track_tasks[track.source_id], description=label)
 
-        def on_error(track: Track, exc: Exception) -> None:
-            console.log(f"[red]Error[/red] processing '{track.title}': {exc}")
+            def on_track_complete(track: Track, result: GenerationResult) -> None:
+                # Hide the per-track spinner row
+                with _track_tasks_lock:
+                    tid = _track_tasks.pop(track.source_id, None)
+                    if tid is not None:
+                        progress.update(tid, visible=False)
+                if result.success:
+                    status = "[green]✓[/green]"
+                    src = "BeatSaver" if result.was_beatsaver else "Generated"
+                else:
+                    status = "[red]✗[/red]"
+                    src = f"Error: {result.error}"
+                console.log(f"{status} {track.artist} – {track.title} [{src}]")
 
-        result = pipeline_mod.run(
-            tracks=tracks,
-            config=cfg,
-            playlist_info=playlist_info,
-            on_progress=on_progress,
-            on_batch_confirm=on_batch_confirm,
-            on_url_review=on_url_review,
-            on_track_complete=on_track_complete,
-            on_error=on_error,
-        )
+            def on_error(track: Track, exc: Exception) -> None:
+                console.log(f"[red]Error[/red] processing '{track.title}': {exc}")
+
+            result = pipeline_mod.run(
+                tracks=tracks,
+                config=cfg,
+                playlist_info=playlist_info,
+                on_progress=on_progress,
+                on_batch_confirm=on_batch_confirm,
+                on_url_review=on_url_review,
+                on_track_complete=on_track_complete,
+                on_track_stage=on_track_stage,
+                on_error=on_error,
+            )
+
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted.[/yellow]")
+        os._exit(130)
 
     # --- Summary ---
     console.print()

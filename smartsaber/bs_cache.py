@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -66,6 +67,7 @@ class BSCache:
     def __init__(self, path: Path = _DEFAULT_CACHE_PATH) -> None:
         self._path = path
         self._data: dict[str, dict] = {}
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -111,19 +113,21 @@ class BSCache:
             return False, None
 
     def put_match(self, track: Track, match: BeatSaverMatch) -> None:
-        self._data[_cache_key(track)] = {
-            "title": track.title,
-            "artist": track.artist,
-            "map": _map_to_dict(match.map),
-            "title_score": match.title_score,
-            "artist_score": match.artist_score,
-        }
-        self._save()
+        with self._lock:
+            self._data[_cache_key(track)] = {
+                "title": track.title,
+                "artist": track.artist,
+                "map": _map_to_dict(match.map),
+                "title_score": match.title_score,
+                "artist_score": match.artist_score,
+            }
+            self._save()
 
     def put_miss(self, track: Track) -> None:
-        self._data[_cache_key(track)] = {
-            "title": track.title,
-            "artist": track.artist,
-            "miss": True,
-        }
-        self._save()
+        with self._lock:
+            self._data[_cache_key(track)] = {
+                "title": track.title,
+                "artist": track.artist,
+                "miss": True,
+            }
+            self._save()

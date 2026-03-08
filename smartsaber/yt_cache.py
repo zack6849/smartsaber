@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,7 @@ class YTCache:
     def __init__(self, path: Path = _DEFAULT_CACHE_PATH) -> None:
         self._path = path
         self._data: dict[str, dict] = {}
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -73,12 +75,23 @@ class YTCache:
         entry = self._data.get(_cache_key(track))
         return entry.get("url") if entry else None
 
+    def put_url(self, track: Track, url: str) -> None:
+        """Persist a resolved URL immediately, before the audio is downloaded.
+        Preserves any existing audio_path so a later put() doesn't lose it."""
+        with self._lock:
+            key = _cache_key(track)
+            entry = self._data.get(key, {})
+            entry.update({"title": track.title, "artist": track.artist, "url": url})
+            self._data[key] = entry
+            self._save()
+
     def put(self, track: Track, url: str, audio_path: Path) -> None:
         """Store a resolved URL and downloaded file path."""
-        self._data[_cache_key(track)] = {
-            "title": track.title,
-            "artist": track.artist,
-            "url": url,
-            "audio_path": str(audio_path),
-        }
-        self._save()
+        with self._lock:
+            self._data[_cache_key(track)] = {
+                "title": track.title,
+                "artist": track.artist,
+                "url": url,
+                "audio_path": str(audio_path),
+            }
+            self._save()

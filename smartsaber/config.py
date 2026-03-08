@@ -22,7 +22,7 @@ class SmartSaberConfig:
 
     # Output
     output_dir: Path = Path("./output")
-    keep_audio: bool = False
+    keep_audio: bool = True
 
     # Matching
     title_threshold: float = 85.0
@@ -36,6 +36,10 @@ class SmartSaberConfig:
     difficulties: list[str] = field(
         default_factory=lambda: ["Easy", "Normal", "Hard", "Expert", "ExpertPlus"]
     )
+
+    # Worker pools (download is I/O-bound; generate is CPU-bound)
+    download_workers: int = 4      # parallel audio downloads
+    generate_workers: int = 2      # parallel map generators (analysis + note gen)
 
     # BeatSaver
     beatsaver_delay: float = 0.25  # seconds between requests

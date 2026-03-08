@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 
@@ -125,9 +126,20 @@ def resolve_url(
     return YouTubeResolution(track=track, url=None, duration_diff_s=0.0, source="not_found")
 
 
+def _yt_video_id(url: str) -> Optional[str]:
+    """Extract the YouTube video ID from any common URL format."""
+    parsed = urlparse(url)
+    if parsed.hostname in ("youtu.be",):
+        return parsed.path.lstrip("/").split("/")[0] or None
+    if parsed.hostname in ("www.youtube.com", "youtube.com", "m.youtube.com"):
+        return parse_qs(parsed.query).get("v", [None])[0]
+    return None
+
+
 def _download_url(url: str, track: Track, tmp_dir: Path, prefer_ogg: bool) -> Optional[Path]:
     """Download a specific YouTube URL. Returns the local file path or None."""
-    safe_name = f"audio_{track.source_id}"
+    video_id = _yt_video_id(url)
+    safe_name = f"yt_{video_id}" if video_id else f"audio_{track.source_id}"
     dl_opts = _build_ydl_opts(tmp_dir, prefer_ogg=prefer_ogg)
     dl_opts["outtmpl"] = str(tmp_dir / f"{safe_name}.%(ext)s")
 

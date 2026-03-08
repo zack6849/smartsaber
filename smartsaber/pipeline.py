@@ -18,6 +18,8 @@ import logging
 import random
 import shutil
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -52,6 +54,7 @@ OnProgress = Callable[[str, int, int], None]
 OnBatchConfirm = Callable[[list[Track]], list[Track]]
 OnUrlReview = Callable[[list[YouTubeResolution]], list[YouTubeResolution]]
 OnTrackComplete = Callable[[Track, GenerationResult], None]
+OnTrackStage = Callable[[Track, str], None]
 OnError = Callable[[Track, Exception], None]
 
 
@@ -68,6 +71,10 @@ def _noop_url_review(resolutions: list[YouTubeResolution]) -> list[YouTubeResolu
 
 
 def _noop_track_complete(track: Track, result: GenerationResult) -> None:
+    pass
+
+
+def _noop_track_stage(track: Track, stage: str) -> None:
     pass
 
 
@@ -96,6 +103,7 @@ def run(
     on_batch_confirm: OnBatchConfirm = _noop_batch_confirm,
     on_url_review: OnUrlReview = _noop_url_review,
     on_track_complete: OnTrackComplete = _noop_track_complete,
+    on_track_stage: OnTrackStage = _noop_track_stage,
     on_error: OnError = _noop_error,
 ) -> PipelineResult:
     """
@@ -252,42 +260,114 @@ def run(
         resolutions = on_url_review(resolutions)
         resolution_map = {r.track.source_id: r for r in resolutions}
 
+        # Persist URLs to cache immediately — before any download starts.
+        # This way a re-run after an interrupted generation skips the YouTube
+        # search entirely, even for tracks that never finished downloading.
+        for r in resolutions:
+            if r.url and r.source in ("search", "override"):
+                yt_cache.put_url(r.track, r.url)
+
     # ------------------------------------------------------------------
-    # Phase 5: Generate local maps
+    # Phase 5: Download + Generate (producer-consumer pipeline)
+    #
+    # dl_executor  — I/O-bound, many workers: fetches audio in parallel.
+    # gen_executor — CPU-bound, fewer workers: analyse + generate + write.
+    #
+    # As each download completes it is immediately handed to the gen pool,
+    # so generation starts on early tracks while later ones are still
+    # downloading.
     # ------------------------------------------------------------------
     on_progress("generate", 0, len(to_generate))
-    rng = random.Random(1337)
-
     difficulties_enum = [Difficulty(d) for d in config.difficulties]
+    completed_count = 0
+    counter_lock = threading.Lock()
 
-    for k, track in enumerate(to_generate, 1):
-        on_progress("generate", k, len(to_generate))
-        try:
-            result = _generate_one(
-                track,
-                output_dir,
-                difficulties_enum,
-                rng,
-                config,
-                cache=yt_cache,
-                resolution=resolution_map.get(track.source_id),
-            )
+    def _do_download(i: int, track: Track) -> tuple[int, Track, Optional[Path]]:
+        on_track_stage(track, "Downloading audio")
+        audio_path = fetch_audio(
+            track,
+            output_dir,
+            prefer_ogg=True,
+            cache=yt_cache,
+            resolution=resolution_map.get(track.source_id),
+        )
+        return i, track, audio_path
+
+    def _do_generate(i: int, track: Track, audio_path: Path) -> GenerationResult:
+        return _generate_from_audio(
+            track,
+            audio_path,
+            output_dir,
+            difficulties_enum,
+            random.Random(1337 + i),
+            config,
+            on_stage=lambda stage: on_track_stage(track, stage),
+        )
+
+    dl_executor = ThreadPoolExecutor(max_workers=config.download_workers)
+    gen_executor = ThreadPoolExecutor(max_workers=config.generate_workers)
+
+    dl_futures = {
+        dl_executor.submit(_do_download, i, track): track
+        for i, track in enumerate(to_generate)
+    }
+    gen_futures: dict = {}
+
+    def _record(track: Track, result: GenerationResult) -> None:
+        nonlocal generated_count, error_count, completed_count
+        results.append(result)
+        on_track_complete(track, result)
+        with counter_lock:
             if result.success:
                 generated_count += 1
             else:
                 error_count += 1
-        except Exception as exc:
-            on_error(track, exc)
-            result = GenerationResult(
-                track=track,
-                success=False,
-                output_path=None,
-                map_hash=None,
-                error=str(exc),
-            )
-            error_count += 1
-        results.append(result)
-        on_track_complete(track, result)
+            completed_count += 1
+            on_progress("generate", completed_count, len(to_generate))
+
+    try:
+        # Feed completed downloads straight into the generation pool
+        for dl_future in as_completed(dl_futures):
+            try:
+                i, track, audio_path = dl_future.result()
+            except Exception as exc:
+                track = dl_futures[dl_future]
+                on_error(track, exc)
+                _record(track, GenerationResult(
+                    track=track, success=False,
+                    output_path=None, map_hash=None, error=str(exc),
+                ))
+                continue
+
+            if audio_path is None:
+                _record(track, GenerationResult(
+                    track=track, success=False,
+                    output_path=None, map_hash=None, error="Audio download failed",
+                ))
+                continue
+
+            gen_futures[gen_executor.submit(_do_generate, i, track, audio_path)] = track
+
+        # Collect generation results
+        for gen_future in as_completed(gen_futures):
+            track = gen_futures[gen_future]
+            try:
+                result = gen_future.result()
+            except Exception as exc:
+                on_error(track, exc)
+                result = GenerationResult(
+                    track=track, success=False,
+                    output_path=None, map_hash=None, error=str(exc),
+                )
+            _record(track, result)
+
+    except KeyboardInterrupt:
+        dl_executor.shutdown(wait=False, cancel_futures=True)
+        gen_executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        dl_executor.shutdown(wait=True)
+        gen_executor.shutdown(wait=True)
 
     client.close()
 
@@ -319,35 +399,20 @@ def run(
 
 
 # ---------------------------------------------------------------------------
-# Single-track generation
+# Per-track worker functions
 # ---------------------------------------------------------------------------
 
-def _generate_one(
+def _generate_from_audio(
     track: Track,
+    audio_path: Path,
     output_dir: Path,
     difficulties: list[Difficulty],
     rng: random.Random,
     config: SmartSaberConfig,
-    cache: Optional[YTCache] = None,
-    resolution: Optional[YouTubeResolution] = None,
+    on_stage: Callable[[str], None] = lambda _: None,
 ) -> GenerationResult:
-    """Download audio, analyse, generate, and write map files for one track."""
-    audio_path = fetch_audio(
-        track,
-        output_dir,
-        prefer_ogg=True,
-        cache=cache,
-        resolution=resolution,
-    )
-    if audio_path is None:
-        return GenerationResult(
-            track=track,
-            success=False,
-            output_path=None,
-            map_hash=None,
-            error="Audio download failed",
-        )
-
+    """CPU-bound half: analyse audio, generate notes, write map files."""
+    on_stage("Analysing BPM")
     analysis = analyze(audio_path)
 
     map_info = MapInfo(
@@ -359,8 +424,10 @@ def _generate_one(
         preview_duration=min(10.0, analysis.duration_s * 0.1),
     )
 
+    on_stage("Generating notes")
     map_diffs = generate_all_difficulties(analysis, difficulties, rng)
 
+    on_stage("Writing files")
     folder = build_map(
         info=map_info,
         difficulties=map_diffs,
@@ -371,7 +438,6 @@ def _generate_one(
         artist_for_folder=track.artist,
     )
 
-    # Optionally clean up downloaded audio
     if not config.keep_audio:
         try:
             audio_path.unlink(missing_ok=True)
