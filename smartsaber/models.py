@@ -97,6 +97,20 @@ class AudioAnalysis:
     bass_energy_curve: list[float] = field(default_factory=list)
     mid_energy_curve: list[float] = field(default_factory=list)
     treble_energy_curve: list[float] = field(default_factory=list)
+    # --- Salience features (v4+) ---
+    # Per-onset strength: how strong is each onset in onset_times?
+    # Normalised 0-1 within each song.  Same length as onset_times.
+    onset_strengths: list[float] = field(default_factory=list)
+    # Per-onset metrical weight: how strong is the beat position?
+    # Downbeat=1.0, backbeat=0.8, off-beat=0.5, sixteenth=0.25.
+    # Same length as onset_times.
+    onset_metrical_weights: list[float] = field(default_factory=list)
+    # Per-segment mean RMS energy (same length as number of segments,
+    # i.e. len(segment_times) - 1).  Used to scale note density by section.
+    segment_energies: list[float] = field(default_factory=list)
+    # Spectral novelty curve — per-frame cosine distance between consecutive
+    # mel spectrogram frames, normalised 0-1.  Same timestamps as rms_times.
+    spectral_novelty_curve: list[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

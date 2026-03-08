@@ -7,7 +7,7 @@ Two levels:
 - File cache : if the downloaded audio file still exists on disk, return it directly
                (useful when keep_audio=True, or within the same run).
 
-Cache key is a normalised "title::artist" string rather than source_id so that
+Cache key uses light_norm(title)::light_norm(artist) from utils.py so that
 CSV imports (which get unstable file_0, file_1 IDs) stay cache-hit across re-runs
 of the same playlist.
 """
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from smartsaber.models import Track
-from smartsaber.utils import normalize_string
+from smartsaber.utils import cache_key as _cache_key_raw
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ _DEFAULT_CACHE_PATH = Path.home() / ".smartsaber" / "yt_cache.json"
 
 def _cache_key(track: Track) -> str:
     """Stable cache key regardless of source (Spotify ID or CSV file_N)."""
-    return f"{normalize_string(track.title)}::{normalize_string(track.artist)}"
+    return _cache_key_raw(track.title, track.artist)
 
 
 class YTCache:

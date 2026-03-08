@@ -54,6 +54,10 @@ def analyze(audio_path: Path) -> AudioAnalysis:
             treble_energy_curve=[],
             segment_times=[0.0, duration_s],
             duration_s=duration_s,
+            onset_strengths=[],
+            onset_metrical_weights=[],
+            segment_energies=[],
+            spectral_novelty_curve=[],
         )
 
     # --- STFT + HPSS ---
@@ -92,17 +96,33 @@ def analyze(audio_path: Path) -> AudioAnalysis:
     perc_onset_times = _quantize_onsets(perc_onset_times_raw.tolist(), beat_times, beat_duration)
 
     # --- Harmonic onsets (melody, chords, vocals, bass notes) ---
-    # delta=0.05: melodic onsets are softer — lower threshold catches chord
-    # changes and vocal entries that would be missed at the default 0.07.
+    # delta=0.02: low threshold catches quiet piano notes, bass lines, and
+    # soft vocal entries.  Extra onsets in loud sections are handled by the
+    # generator's sliding-window selection and density control.
     harm_onset_frames = librosa.onset.onset_detect(
         onset_envelope=onset_env_harm, sr=sr, hop_length=_HOP, backtrack=True,
-        delta=0.05,
+        delta=0.02,
     )
     harm_onset_times_raw = librosa.frames_to_time(harm_onset_frames, sr=sr, hop_length=_HOP)
     harm_onset_times = _quantize_onsets(harm_onset_times_raw.tolist(), beat_times, beat_duration)
 
     # --- Merged onset set (deduped, for backward compatibility) ---
     onset_times = sorted({round(t, 4) for t in perc_onset_times + harm_onset_times})
+
+    # --- Onset strengths ---
+    # Sample the combined onset envelope at each detected onset's frame
+    # to get a continuous "how strong is this onset?" value.  This lets the
+    # generator prefer placing notes on the most musically prominent events.
+    onset_strengths = _compute_onset_strengths(
+        onset_times, onset_env_combined, sr, _HOP,
+    )
+
+    # --- Metrical weights ---
+    # Score each onset by its position within the beat grid.
+    # Downbeats (beat 1 of bar) → 1.0, off-beats → lower.
+    onset_metrical_weights = _compute_metrical_weights(
+        onset_times, beat_times, beat_duration, tempo,
+    )
 
     # --- RMS energy (full mix) ---
     rms = librosa.feature.rms(y=y, hop_length=_HOP)[0]
@@ -161,6 +181,14 @@ def analyze(audio_path: Path) -> AudioAnalysis:
     # --- Structural segmentation ---
     segment_times = _segment(y, sr, duration_s)
 
+    # --- Spectral novelty curve ---
+    # Cosine distance between consecutive mel frames — spikes at drops,
+    # breakdowns, key changes, and new instrument entries.
+    spectral_novelty_curve = _spectral_novelty(S, n_rms)
+
+    # --- Per-segment mean RMS energy ---
+    segment_energies = _segment_energies(segment_times, rms_norm, rms_times)
+
     return AudioAnalysis(
         tempo=tempo,
         beat_times=beat_times,
@@ -175,6 +203,10 @@ def analyze(audio_path: Path) -> AudioAnalysis:
         treble_energy_curve=treble_ratio,
         segment_times=segment_times,
         duration_s=duration_s,
+        onset_strengths=onset_strengths,
+        onset_metrical_weights=onset_metrical_weights,
+        segment_energies=segment_energies,
+        spectral_novelty_curve=spectral_novelty_curve,
     )
 
 
@@ -187,6 +219,150 @@ def _align_to_length(lst: list[float], target: int) -> list[float]:
     elif len(lst) < target:
         return lst + [lst[-1]] * (target - len(lst))
     return lst
+
+
+# ---------------------------------------------------------------------------
+# Salience helpers
+# ---------------------------------------------------------------------------
+
+def _compute_onset_strengths(
+    onset_times: list[float],
+    onset_env: np.ndarray,
+    sr: int,
+    hop_length: int,
+) -> list[float]:
+    """Sample the onset strength envelope at each detected onset time.
+
+    Returns a list of normalised strengths (0-1) with the same length as
+    *onset_times*.  The strongest onset in the song gets 1.0.
+    """
+    if not onset_times or len(onset_env) == 0:
+        return []
+
+    # Convert onset times to frame indices and sample the envelope
+    onset_frames = librosa.time_to_frames(onset_times, sr=sr, hop_length=hop_length)
+    raw = []
+    max_frame = len(onset_env) - 1
+    for f in onset_frames:
+        idx = min(int(f), max_frame)
+        raw.append(float(onset_env[idx]))
+
+    # Normalise to 0-1
+    peak = max(raw) if raw else 1.0
+    if peak > 0:
+        return [v / peak for v in raw]
+    return [0.0] * len(raw)
+
+
+def _compute_metrical_weights(
+    onset_times: list[float],
+    beat_times: list[float],
+    beat_duration: float,
+    tempo: float,
+) -> list[float]:
+    """Assign a metrical importance weight (0-1) to each onset.
+
+    Hierarchy (assuming 4/4 time):
+      beat 1 of bar (downbeat):  1.0
+      beat 3 of bar:             0.85
+      beats 2, 4 (backbeat):    0.7
+      eighth-note off-beats:     0.4
+      sixteenth-note positions:  0.2
+    """
+    if not onset_times or not beat_times:
+        return [0.5] * len(onset_times)
+
+    # Estimate bar duration (4 beats in 4/4)
+    bar_duration = beat_duration * 4
+    weights: list[float] = []
+
+    for t in onset_times:
+        # Find nearest beat
+        nearest_idx = min(range(len(beat_times)), key=lambda i: abs(beat_times[i] - t))
+        nearest_beat = beat_times[nearest_idx]
+        dist_to_beat = abs(t - nearest_beat)
+
+        # How far off the beat grid is this onset?
+        # If it's within tolerance of a beat, determine which beat in the bar
+        if dist_to_beat < beat_duration * 0.15:
+            # On a beat — determine bar position
+            # Use the beat index to infer position within the bar
+            beat_in_bar = nearest_idx % 4
+            if beat_in_bar == 0:
+                weights.append(1.0)    # downbeat
+            elif beat_in_bar == 2:
+                weights.append(0.85)   # beat 3
+            else:
+                weights.append(0.7)    # beats 2, 4 (backbeat)
+        elif dist_to_beat < beat_duration * 0.35:
+            # Near an eighth-note off-beat
+            weights.append(0.4)
+        else:
+            # Sixteenth or other subdivision
+            weights.append(0.2)
+
+    return weights
+
+
+def _spectral_novelty(S: np.ndarray, n_rms: int) -> list[float]:
+    """Compute a per-frame spectral novelty curve from the STFT magnitude.
+
+    Uses cosine distance between consecutive normalised spectral frames.
+    Spikes at drops, breakdowns, key changes, and new instrument entries.
+    Returns a list normalised to [0, 1] and aligned to n_rms length.
+    """
+    if S.shape[1] < 2:
+        return [0.0] * n_rms
+
+    # Normalise each frame to unit norm for cosine distance
+    norms = np.linalg.norm(S, axis=0, keepdims=True)
+    norms = np.maximum(norms, 1e-10)
+    S_normed = S / norms
+
+    # Cosine distance = 1 - cosine similarity = 1 - dot(a, b)
+    # Compute pairwise for consecutive frames
+    cos_sim = np.sum(S_normed[:, :-1] * S_normed[:, 1:], axis=0)
+    novelty = 1.0 - np.clip(cos_sim, -1.0, 1.0)
+
+    # Prepend a 0 for the first frame (no predecessor)
+    novelty = np.concatenate([[0.0], novelty])
+
+    # Normalise to [0, 1]
+    nmax = novelty.max()
+    if nmax > 0:
+        novelty = novelty / nmax
+
+    return _align_to_length(novelty.tolist(), n_rms)
+
+
+def _segment_energies(
+    segment_times: list[float],
+    rms_curve: list[float],
+    rms_times: list[float],
+) -> list[float]:
+    """Compute mean RMS energy for each structural segment.
+
+    Returns one float per segment (len(segment_times) - 1 values).
+    """
+    if len(segment_times) < 2 or not rms_curve or not rms_times:
+        return []
+
+    energies: list[float] = []
+    for i in range(len(segment_times) - 1):
+        seg_start = segment_times[i]
+        seg_end = segment_times[i + 1]
+
+        # Find RMS frames within this segment
+        start_idx = bisect.bisect_left(rms_times, seg_start)
+        end_idx = bisect.bisect_right(rms_times, seg_end)
+
+        if start_idx < end_idx and end_idx <= len(rms_curve):
+            seg_rms = rms_curve[start_idx:end_idx]
+            energies.append(sum(seg_rms) / len(seg_rms))
+        else:
+            energies.append(0.0)
+
+    return energies
 
 
 def _quantize_onsets(
@@ -252,6 +428,13 @@ def _segment(y: np.ndarray, sr: int, duration_s: float) -> list[float]:
 def rms_at(analysis: AudioAnalysis, time_s: float) -> float:
     """Interpolate RMS energy at a given time (0-1)."""
     return _interpolate_curve(analysis.rms_times, analysis.rms_curve, time_s, default=0.5)
+
+
+def bass_energy_at(analysis: AudioAnalysis, time_s: float) -> float:
+    """Interpolate bass energy ratio (0-1) at a given time."""
+    if not analysis.bass_energy_curve:
+        return 0.33
+    return _interpolate_curve(analysis.rms_times, analysis.bass_energy_curve, time_s, default=0.33)
 
 
 def centroid_at(analysis: AudioAnalysis, time_s: float) -> float:
@@ -324,6 +507,33 @@ def band_row_at(analysis: AudioAnalysis, time_s: float, energy: float = 0.5) -> 
     return 0
 
 
+def novelty_at(analysis: AudioAnalysis, time_s: float) -> float:
+    """Interpolate spectral novelty (0-1) at a given time.
+
+    High values indicate moments of large spectral change — drops, breakdowns,
+    key changes, new instrument entries.  Used by the generator to boost
+    emphasis (doubles, pattern transitions) at musically significant moments.
+    """
+    if not analysis.spectral_novelty_curve:
+        return 0.0
+    return _interpolate_curve(
+        analysis.rms_times, analysis.spectral_novelty_curve, time_s, default=0.0,
+    )
+
+
+def segment_energy_at(analysis: AudioAnalysis, time_s: float) -> float:
+    """Return the mean RMS energy of the structural segment containing *time_s*.
+
+    Falls back to 0.5 if segment energy data is not available.
+    """
+    if not analysis.segment_energies or len(analysis.segment_times) < 2:
+        return 0.5
+    # Find which segment this time falls in
+    seg_idx = bisect.bisect_right(analysis.segment_times, time_s) - 1
+    seg_idx = max(0, min(seg_idx, len(analysis.segment_energies) - 1))
+    return analysis.segment_energies[seg_idx]
+
+
 def _interpolate_curve(times: list[float], curve: list[float], time_s: float, default: float) -> float:
     """Linear interpolation of a sampled curve at an arbitrary time.
 
@@ -348,8 +558,3 @@ def _interpolate_curve(times: list[float], curve: list[float], time_s: float, de
     v0, v1 = curve[i - 1], curve[i]
     alpha = (time_s - t0) / (t1 - t0) if t1 != t0 else 0.0
     return v0 + alpha * (v1 - v0)
-
-
-def time_to_beat(time_s: float, tempo: float, offset_s: float = 0.0) -> float:
-    """Convert a time in seconds to a beat number."""
-    return (time_s - offset_s) * tempo / 60.0

@@ -19,14 +19,20 @@ output/
 
 # Corpus analysis cache (downloaded BeatSaver map zips)
 corpus_cache/
+beatsaver_cache/
 
 # Personal playlist exports (CSV/JSON) — don't commit your own data
 *.csv
 *.json
 
+# Audio/calibration artifacts
+*.wav
+*.ogg
+*.mid
+
 # Editor
 .idea/
 smartsaber/.idea
 
-# Claude Code
+# AI agent project files
 .claude

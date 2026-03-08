@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import threading
 import time as _time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -408,23 +408,26 @@ def run(
 
     # --- Fast path: process all pre-resolved tracks in parallel ---
     # These tracks already have audio on disk (song.egg), so no download is
-    # needed.  We still use ProcessPoolExecutor because note generation is
-    # pure-Python CPU work (GIL-bound).  The analysis cache is primed, so
-    # each worker just reads a small JSON file — no heavy librosa import.
+    # needed.  ThreadPoolExecutor is used: librosa/numpy/scipy release the
+    # GIL during all their C computations, so threads achieve real parallelism
+    # without the subprocess/fork/BLAS-initialisation races that plague
+    # ProcessPoolExecutor on WSL2.
     if pre_resolved_audio:
         _fast_t0 = _time.perf_counter()
         _fast_count = len(pre_resolved_audio)
         _fast_workers = min(config.generate_workers, _fast_count)
         on_debug(f"Phase 5a: FAST PATH — {_fast_count} pre-resolved tracks, "
-                 f"{_fast_workers} workers (ProcessPoolExecutor)")
+                 f"{_fast_workers} workers (ThreadPoolExecutor)")
 
         fast_tracks = [t for t in to_generate if t.source_id in pre_resolved_audio]
+        _fast_cache = AnalysisCache()  # shared across gen threads; thread-safe
 
-        with ProcessPoolExecutor(max_workers=_fast_workers) as fast_executor:
+        with ThreadPoolExecutor(max_workers=_fast_workers) as fast_executor:
             future_to_track = {
                 fast_executor.submit(
-                    _generate_worker, track, pre_resolved_audio[track.source_id],
+                    _generate_from_audio, track, pre_resolved_audio[track.source_id],
                     output_dir, difficulties_enum, config,
+                    analysis_cache=_fast_cache,
                 ): track
                 for track in fast_tracks
             }
@@ -461,7 +464,7 @@ def run(
     if tracks_needing_download:
         _phase5_t0 = _time.perf_counter()
         on_debug(f"Phase 5b: DOWNLOAD PATH — {len(tracks_needing_download)} tracks need download+generate, "
-                 f"dl_workers={config.download_workers}, gen_workers={config.generate_workers}")
+                 f"dl_workers={config.download_workers}, gen_workers={config.generate_workers} (ThreadPoolExecutor)")
         # Per-track timing dict (thread-safe writes, main-thread reads)
         _track_timings: dict[str, dict] = {}
         _track_timings_lock = threading.Lock()
@@ -501,7 +504,14 @@ def run(
                          f"{'OK' if result.success else 'FAIL: ' + str(result.error)}")
 
         dl_executor = ThreadPoolExecutor(max_workers=config.download_workers)
-        gen_executor = ProcessPoolExecutor(max_workers=config.generate_workers)
+        # ThreadPoolExecutor for generation: librosa/numpy/scipy all release
+        # the GIL during their C-level computations (FFT, STFT, HPSS, CQT,
+        # BLAS calls), so threads achieve true parallelism for the heavy work.
+        # ProcessPoolExecutor was tried with fork/spawn/forkserver contexts —
+        # all failed on WSL2: fork→BLAS lock races, spawn→re-runs CLI entry
+        # point, forkserver→pocketfft CQT SIGSEGV after ~25s of work.
+        _gen_cache = AnalysisCache()  # shared across gen threads; thread-safe
+        gen_executor = ThreadPoolExecutor(max_workers=config.generate_workers)
 
         dl_futures = {
             dl_executor.submit(_do_download, track): track
@@ -540,10 +550,11 @@ def run(
                 # Update UI: download done, now queued/running generation
                 on_track_stage(track, "Generating map")
 
-                # Submit generation — runs in a separate process immediately
+                # Submit generation — runs in a thread immediately
                 gen_fut = gen_executor.submit(
-                    _generate_worker, track, audio_path, output_dir,
+                    _generate_from_audio, track, audio_path, output_dir,
                     difficulties_enum, config,
+                    analysis_cache=_gen_cache,
                 )
                 with expected_gen_lock:
                     expected_gen += 1
@@ -668,42 +679,6 @@ def run(
 # ---------------------------------------------------------------------------
 # Per-track worker functions
 # ---------------------------------------------------------------------------
-
-# Per-process analysis cache — created lazily in each worker process so it
-# doesn't need to be pickled across the process boundary.
-_worker_analysis_cache: Optional[AnalysisCache] = None
-
-
-def _get_worker_cache() -> AnalysisCache:
-    """Return a per-process AnalysisCache (created once, reused)."""
-    global _worker_analysis_cache
-    if _worker_analysis_cache is None:
-        _worker_analysis_cache = AnalysisCache()
-    return _worker_analysis_cache
-
-
-def _generate_worker(
-    track: Track,
-    audio_path: Path,
-    output_dir: Path,
-    difficulties: list[Difficulty],
-    config: SmartSaberConfig,
-) -> GenerationResult:
-    """Top-level picklable entry point for ProcessPoolExecutor workers.
-
-    Each worker process lazily creates its own AnalysisCache instance (the
-    cache object contains a threading.Lock which is not picklable, so we
-    can't pass it from the parent process).
-    """
-    return _generate_from_audio(
-        track,
-        audio_path,
-        output_dir,
-        difficulties,
-        config,
-        analysis_cache=_get_worker_cache(),
-    )
-
 
 def _generate_from_audio(
     track: Track,

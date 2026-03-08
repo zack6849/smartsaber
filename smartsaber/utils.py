@@ -59,3 +59,19 @@ def sha1_files(*paths: Path) -> str:
     for p in paths:
         h.update(p.read_bytes())
     return h.hexdigest().upper()
+
+
+def light_norm(s: str) -> str:
+    """Unicode + whitespace normalisation without stripping qualifiers.
+
+    Unlike normalize_string(), this keeps parenthetical suffixes like
+    (Remix), (Radio Edit), (feat. X) — they distinguish different versions
+    of the same song and must produce different cache keys.
+    """
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", s).lower().strip()
+
+
+def cache_key(title: str, artist: str) -> str:
+    """Stable cache key from title + artist, regardless of source."""
+    return f"{light_norm(title)}::{light_norm(artist)}"

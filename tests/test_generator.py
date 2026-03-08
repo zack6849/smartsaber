@@ -173,13 +173,13 @@ def test_parity_not_violated_same_hand():
                 if after is not None:
                     parity = after
 
-        # Allow up to ~55% violations — we intentionally use "soft parity"
-        # (50% enforcement) to match human map direction distributions where
-        # DOWN:UP ratio is ~1.4:1 rather than forced 1:1 strict alternation.
+        # Allow up to ~70% violations — we intentionally use "soft parity"
+        # (50% at row 1-2, 15% at row 0) to prevent upstrokes at waist level
+        # and match human map direction distributions.
         total_notes = len(md.notes)
         if total_notes > 0:
             violation_rate = violations / total_notes
-            assert violation_rate < 0.55, (
+            assert violation_rate < 0.70, (
                 f"Parity violation rate {violation_rate:.1%} ({violations}/{total_notes}) "
                 f"too high for {diff.value}"
             )
@@ -299,24 +299,30 @@ def test_no_crossovers():
 
 
 def test_no_huge_vertical_jumps():
-    """No consecutive same-hand notes should jump from row 0→2 or 2→0."""
-    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
-    md = generate_difficulty(analysis, Difficulty.EXPERT, rng=random.Random(42))
-    from collections import defaultdict
-    by_hand: dict[NoteType, list] = defaultdict(list)
-    for n in md.notes:
-        by_hand[n.type].append(n)
+    """At Easy/Normal, no consecutive same-hand notes should jump row 0→2 or 2→0.
 
-    for hand, notes in by_hand.items():
-        notes_sorted = sorted(notes, key=lambda n: n.time)
-        for i in range(1, len(notes_sorted)):
-            prev_row = notes_sorted[i - 1].line_layer
-            curr_row = notes_sorted[i].line_layer
-            jump = abs(curr_row - prev_row)
-            assert jump <= 1, (
-                f"Huge vertical jump: {hand} row {prev_row}→{curr_row} "
-                f"at beat {notes_sorted[i].time}"
-            )
+    At Hard+ the generator allows direct row jumps for more vertical variety
+    (corpus: row 2 usage rises from 7% Easy to 19% ExpertPlus).
+    """
+    analysis = _simple_analysis(duration_s=120.0, tempo=120.0)
+    # Only enforce adjacent-row constraint at Easy/Normal
+    for diff in (Difficulty.EASY, Difficulty.NORMAL):
+        md = generate_difficulty(analysis, diff, rng=random.Random(42))
+        from collections import defaultdict
+        by_hand: dict[NoteType, list] = defaultdict(list)
+        for n in md.notes:
+            by_hand[n.type].append(n)
+
+        for hand, notes in by_hand.items():
+            notes_sorted = sorted(notes, key=lambda n: n.time)
+            for i in range(1, len(notes_sorted)):
+                prev_row = notes_sorted[i - 1].line_layer
+                curr_row = notes_sorted[i].line_layer
+                jump = abs(curr_row - prev_row)
+                assert jump <= 1, (
+                    f"Huge vertical jump ({diff}): {hand} row {prev_row}→{curr_row} "
+                    f"at beat {notes_sorted[i].time}"
+                )
 
 
 def test_doubles_same_direction():

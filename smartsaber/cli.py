@@ -115,6 +115,146 @@ def cmd_login() -> None:
 
 
 # ---------------------------------------------------------------------------
+# clean command
+# ---------------------------------------------------------------------------
+
+@main.command("clean")
+@click.option(
+    "--output", "-o",
+    default=None,
+    type=click.Path(path_type=Path),
+    help="Output directory to clean (default: from config / env).",
+)
+@click.option(
+    "--maps-only",
+    is_flag=True, default=False,
+    help="Only delete generated map folders from the output dir; keep caches.",
+)
+@click.option(
+    "--cache-only",
+    is_flag=True, default=False,
+    help="Only delete ~/.smartsaber caches; keep generated maps.",
+)
+@click.option(
+    "--yes", "-y",
+    is_flag=True, default=False,
+    help="Skip confirmation prompt.",
+)
+def cmd_clean(
+    output: Optional[Path],
+    maps_only: bool,
+    cache_only: bool,
+    yes: bool,
+) -> None:
+    """Remove SmartSaber-generated maps and/or caches.
+
+    \b
+    By default, deletes both caches AND generated maps.
+    Only removes folders prefixed with SmartSaber_ or BeatSaver_,
+    plus _audio_tmp and .bplist files — never touches other content
+    in the output directory.
+    """
+    import shutil
+
+    cfg = load_config()
+    output_dir = output or cfg.output_dir
+    cache_dir = Path.home() / ".smartsaber"
+
+    # If neither flag is set, clean both
+    clean_maps = not cache_only
+    clean_cache = not maps_only
+
+    # --- Inventory what we'd delete ---
+    map_folders: list[Path] = []
+    bplist_files: list[Path] = []
+    audio_tmp: Optional[Path] = None
+
+    if clean_maps and output_dir.is_dir():
+        for entry in output_dir.iterdir():
+            if entry.is_dir() and entry.name.startswith(("SmartSaber_", "BeatSaver_")):
+                map_folders.append(entry)
+            elif entry.is_dir() and entry.name == "_audio_tmp":
+                audio_tmp = entry
+            elif entry.is_file() and entry.suffix == ".bplist":
+                bplist_files.append(entry)
+
+    cache_files: list[Path] = []
+    if clean_cache and cache_dir.is_dir():
+        # Individual cache items we manage
+        for name in ("yt_cache.json", "bs_cache.json"):
+            p = cache_dir / name
+            if p.exists():
+                cache_files.append(p)
+        analysis_dir = cache_dir / "analysis"
+        if analysis_dir.is_dir():
+            cache_files.append(analysis_dir)
+
+    # --- Show what we'll delete ---
+    if not map_folders and not bplist_files and not audio_tmp and not cache_files:
+        console.print("[dim]Nothing to clean.[/dim]")
+        return
+
+    if clean_maps:
+        console.print(f"\n[bold]Output directory:[/bold] {output_dir}")
+        if map_folders:
+            console.print(f"  [red]{len(map_folders)}[/red] map folder(s)  (SmartSaber_* / BeatSaver_*)")
+        if bplist_files:
+            console.print(f"  [red]{len(bplist_files)}[/red] .bplist file(s)")
+        if audio_tmp:
+            console.print(f"  [red]1[/red] _audio_tmp folder")
+        if not map_folders and not bplist_files and not audio_tmp:
+            console.print("  [dim]No SmartSaber files found.[/dim]")
+
+    if clean_cache:
+        console.print(f"\n[bold]Cache directory:[/bold] {cache_dir}")
+        if cache_files:
+            for cf in cache_files:
+                console.print(f"  [red]•[/red] {cf.name}")
+        else:
+            console.print("  [dim]No caches found.[/dim]")
+
+    console.print()
+
+    if not yes:
+        confirm = click.confirm("Delete these files?", default=False)
+        if not confirm:
+            console.print("[dim]Cancelled.[/dim]")
+            return
+
+    # --- Delete ---
+    deleted = 0
+    for folder in map_folders:
+        try:
+            shutil.rmtree(folder)
+            deleted += 1
+        except Exception as exc:
+            err_console.print(f"[yellow]Could not delete {folder.name}:[/yellow] {exc}")
+    for bp in bplist_files:
+        try:
+            bp.unlink()
+            deleted += 1
+        except Exception as exc:
+            err_console.print(f"[yellow]Could not delete {bp.name}:[/yellow] {exc}")
+    if audio_tmp:
+        try:
+            shutil.rmtree(audio_tmp)
+            deleted += 1
+        except Exception as exc:
+            err_console.print(f"[yellow]Could not delete _audio_tmp:[/yellow] {exc}")
+    for cf in cache_files:
+        try:
+            if cf.is_dir():
+                shutil.rmtree(cf)
+            else:
+                cf.unlink()
+            deleted += 1
+        except Exception as exc:
+            err_console.print(f"[yellow]Could not delete {cf.name}:[/yellow] {exc}")
+
+    console.print(f"[bold green]✓ Cleaned {deleted} item(s).[/bold green]")
+
+
+# ---------------------------------------------------------------------------
 # import command (the main one)
 # ---------------------------------------------------------------------------
 
@@ -125,6 +265,12 @@ def cmd_login() -> None:
     default=None,
     type=click.Path(exists=True, path_type=Path),
     help="Import from an Exportify CSV or JSON file instead of fetching from Spotify.",
+)
+@click.option(
+    "--all-files", "-a",
+    is_flag=True, default=False,
+    help="Import all CSV/JSON files in the import/ folder without prompting. "
+         "Useful with --regen to reprocess your entire library at once.",
 )
 @click.option(
     "--output", "-o",
@@ -218,6 +364,7 @@ def cmd_login() -> None:
 def cmd_import(
     url: Optional[str],
     from_file: Optional[Path],
+    all_files: bool,
     output: Optional[Path],
     title_threshold: Optional[float],
     artist_threshold: Optional[float],
@@ -282,13 +429,61 @@ def cmd_import(
         cfg.generate_workers = max(1, generate_workers)
 
     # --- Load tracks ---
+    if all_files:
+        from smartsaber.fileimport import load_tracks as _load_tracks
+        from smartsaber.models import PlaylistInfo as _PlaylistInfo
+        import_dir = Path("import")
+        if not import_dir.is_dir():
+            err_console.print(
+                "[red]No import/ folder found.[/red] "
+                "Create one and drop your Exportify CSV files in it."
+            )
+            sys.exit(1)
+        import_files = sorted(
+            p for p in import_dir.iterdir()
+            if p.is_file() and p.suffix.lower() in (".csv", ".json")
+        )
+        if not import_files:
+            err_console.print("[red]No CSV or JSON files found in import/.[/red]")
+            sys.exit(1)
+        tracks = []
+        for p in import_files:
+            try:
+                file_tracks = _load_tracks(p)
+                # Prefix source_id with filename to prevent collisions.
+                # CSV imports assign source_id = "file_0", "file_1", etc.
+                # which collide across files → wrong audio in wrong map.
+                for t in file_tracks:
+                    if t.source_id.startswith(("file_", "json_")):
+                        t.source_id = f"{p.stem}_{t.source_id}"
+                tracks.extend(file_tracks)
+                console.print(f"  [dim]{p.name}[/dim] — {len(file_tracks)} tracks")
+            except Exception as exc:
+                err_console.print(f"[yellow]Skipping {p.name}:[/yellow] {exc}")
+        # Deduplicate by (title, artist) — same song may appear in multiple playlists
+        seen: set[tuple[str, str]] = set()
+        deduped = []
+        for t in tracks:
+            key = (t.title.lower(), t.artist.lower())
+            if key not in seen:
+                seen.add(key)
+                deduped.append(t)
+        tracks = deduped
+        playlist_info = _PlaylistInfo(
+            name="All Playlists",
+            description=f"{len(import_files)} files",
+            cover_url=None,
+            track_count=len(tracks),
+        )
+        console.print(f"[bold]All import files[/bold] — {len(tracks)} tracks ({len(import_files)} files)")
+
     # No args at all — offer a file picker from the import/ folder
-    if not from_file and not url:
+    elif not from_file and not url:
         from_file = _pick_import_file()
         if from_file is None:
             sys.exit(1)
 
-    if from_file:
+    if not all_files and from_file:
         from smartsaber.fileimport import load_tracks
         from smartsaber.models import PlaylistInfo as _PlaylistInfo
         try:

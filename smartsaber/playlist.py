@@ -12,6 +12,7 @@ import httpx
 
 from smartsaber.models import GenerationResult, PlaylistInfo
 from smartsaber.mapbuilder import compute_map_hash
+from smartsaber.utils import safe_filename
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ def build_playlist(
         "songs": songs,
     }
 
-    dest = output_dir / _safe_filename(playlist_info.name or "smartsaber_playlist")
+    dest = output_dir / safe_filename(playlist_info.name or "smartsaber_playlist")
     dest = dest.with_suffix(".bplist")
     dest.write_text(json.dumps(playlist, indent=2), encoding="utf-8")
     return dest
@@ -98,9 +99,3 @@ def _fetch_cover_b64(url: str) -> str:
     except Exception as exc:
         logger.warning("Failed to fetch playlist cover: %s", exc)
         return ""
-
-
-def _safe_filename(s: str) -> str:
-    import re
-    s = re.sub(r'[\\/:*?"<>|]', "_", s)
-    return s[:80].strip()

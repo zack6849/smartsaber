@@ -5,8 +5,11 @@ Cache file: ~/.smartsaber/bs_cache.json
 Stores both hits (map found) and misses (no map found) to avoid
 redundant API calls on repeated imports of the same playlist.
 
-Cache key: normalize_string(title)::normalize_string(artist)
-(stable across CSV re-imports with unstable source_ids)
+Cache key: light_norm(title)::light_norm(artist) (from utils.py).
+Uses light_norm() — NOT normalize_string() — so that parenthetical
+qualifiers like (Remix), (feat. X), (Remastered 2011) are preserved
+in the key.  normalize_string() strips those, which causes different
+versions of the same song to collide in the cache.
 
 To force a fresh search for all tracks, delete the cache file.
 """
@@ -20,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from smartsaber.models import BeatSaverMap, BeatSaverMatch, Track
-from smartsaber.utils import normalize_string
+from smartsaber.utils import cache_key as _cache_key_raw
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +31,7 @@ _DEFAULT_CACHE_PATH = Path.home() / ".smartsaber" / "bs_cache.json"
 
 
 def _cache_key(track: Track) -> str:
-    return f"{normalize_string(track.title)}::{normalize_string(track.artist)}"
+    return _cache_key_raw(track.title, track.artist)
 
 
 def _map_to_dict(m: BeatSaverMap) -> dict:

@@ -34,7 +34,7 @@ _LEGACY_CACHE_PATH = Path.home() / ".smartsaber" / "analysis_cache.json"
 # Bump this whenever the analyser output format changes (new fields, tuned
 # delta thresholds, etc.) so that old cached entries are automatically
 # re-analysed instead of silently returning stale data.
-_CACHE_VERSION = 3
+_CACHE_VERSION = 5
 
 # Allowed characters in cache filenames (safe for all OSes)
 _SAFE_RE = re.compile(r'[^a-zA-Z0-9_\-]')
@@ -125,6 +125,10 @@ class AnalysisCache:
                 bass_energy_curve=entry.get("bass_energy_curve", []),
                 mid_energy_curve=entry.get("mid_energy_curve", []),
                 treble_energy_curve=entry.get("treble_energy_curve", []),
+                onset_strengths=entry.get("onset_strengths", []),
+                onset_metrical_weights=entry.get("onset_metrical_weights", []),
+                segment_energies=entry.get("segment_energies", []),
+                spectral_novelty_curve=entry.get("spectral_novelty_curve", []),
             )
             self._mem[key] = analysis
             return analysis
@@ -149,6 +153,10 @@ class AnalysisCache:
             "treble_energy_curve": analysis.treble_energy_curve,
             "segment_times": analysis.segment_times,
             "duration_s": analysis.duration_s,
+            "onset_strengths": analysis.onset_strengths,
+            "onset_metrical_weights": analysis.onset_metrical_weights,
+            "segment_energies": analysis.segment_energies,
+            "spectral_novelty_curve": analysis.spectral_novelty_curve,
         }
         with self._lock:
             self._mem[key] = analysis
