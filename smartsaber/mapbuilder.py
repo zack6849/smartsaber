@@ -80,12 +80,16 @@ def build_map(
     if need_audio:
         _convert_audio(audio_path, egg_path)
 
-    # Download cover art (skip if already exists, fall back to placeholder)
+    # Download cover art.  Skip if a real cover already exists.
+    # Placeholder covers are ~1.7KB (256x256 solid dark) — replace those
+    # if we now have a URL (e.g. iTunes lookup for CSV imports).
     cover_path = dest / "cover.jpg"
-    if not cover_path.exists() or cover_path.stat().st_size == 0:
+    _PLACEHOLDER_MAX_BYTES = 2048
+    has_real_cover = cover_path.exists() and cover_path.stat().st_size > _PLACEHOLDER_MAX_BYTES
+    if not has_real_cover:
         if cover_url:
             _download_cover(cover_url, cover_path)
-        else:
+        elif not cover_path.exists():
             _write_default_cover(cover_path)
 
     # Write difficulty .dat files

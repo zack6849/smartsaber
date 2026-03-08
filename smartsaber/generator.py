@@ -278,26 +278,21 @@ def generate_difficulty(
         # Enhanced logic to detect "big hits" - dramatic energy spikes that
         # deserve emphasis with both hands hitting simultaneously.
 
-        # Calculate energy context for spike detection
+        # Calculate energy context for spike detection using bisect for O(log n)
         energy_spike_factor = 0.0
         if len(analysis.rms_curve) > 1 and len(analysis.rms_times) > 1:
-            # Look at energy trend over the past 2-5 seconds
-            lookback_time = 3.0  # seconds
-            past_energies = []
-
-            for i, rms_time in enumerate(analysis.rms_times):
-                if onset_t - lookback_time <= rms_time <= onset_t:
-                    past_energies.append(analysis.rms_curve[i])
-
-            if len(past_energies) >= 3:
-                # Calculate energy spike: current vs recent average
+            import bisect
+            lookback_time = 3.0
+            lo = bisect.bisect_left(analysis.rms_times, onset_t - lookback_time)
+            hi = bisect.bisect_right(analysis.rms_times, onset_t)
+            if hi - lo >= 3:
+                past_energies = analysis.rms_curve[lo:hi]
                 recent_avg = sum(past_energies[:-1]) / max(len(past_energies) - 1, 1)
-                current_energy = past_energies[-1] if past_energies else energy
-
+                current_energy = past_energies[-1]
                 if recent_avg > 0:
-                    energy_spike_factor = max(0, (current_energy - recent_avg) / recent_avg)
-                    # Cap the spike factor to reasonable range
-                    energy_spike_factor = min(energy_spike_factor, 3.0)
+                    energy_spike_factor = min(
+                        max(0, (current_energy - recent_avg) / recent_avg), 3.0
+                    )
 
         # Base double probability from existing logic
         nov = novelty_at(analysis, onset_t)
@@ -574,26 +569,24 @@ def _select_onsets_sliding_window(
         selected_indices = set(idx for _, idx in all_with_salience[:int(total_target * 1.1)])
 
     # Gap-filling pass — scan for gaps larger than max_gap_s and force-select
-    # the best unselected onset in each gap.  Prevents silent holes where
-    # audible musical events (bass lines, piano notes) were detected but
-    # ranked too low by the salience formula.
+    # the best unselected onset in each gap.  Uses bisect for O(log n) lookups
+    # instead of scanning all onsets per gap.
+    import bisect
     max_gap_s = 1.5
-    for _gap_pass in range(5):  # enough passes to subdivide long gaps
+    for _gap_pass in range(5):
         sorted_sel = sorted(selected_indices)
+        sel_times = [onset_times[i] for i in sorted_sel]
         filled_any = False
         prev_t = 0.0
-        for sel_idx in list(sorted_sel) + [len(onset_times)]:
+        for k, sel_idx in enumerate(list(sorted_sel) + [len(onset_times)]):
             cur_t = onset_times[sel_idx] if sel_idx < len(onset_times) else analysis.duration_s
-            gap = cur_t - prev_t
-            if gap > max_gap_s:
-                # Find best unselected onset in this gap
+            if cur_t - prev_t > max_gap_s:
+                # Use bisect to find onset range within this gap — O(log n)
+                lo = bisect.bisect_right(onset_times, prev_t)
+                hi = bisect.bisect_left(onset_times, cur_t)
                 best_sal, best_idx = -1.0, -1
-                for i, t in enumerate(onset_times):
-                    if t <= prev_t or t >= cur_t:
-                        continue
-                    if i in selected_indices:
-                        continue
-                    if salience[i] > best_sal:
+                for i in range(lo, hi):
+                    if i not in selected_indices and salience[i] > best_sal:
                         best_sal = salience[i]
                         best_idx = i
                 if best_idx >= 0:

@@ -745,6 +745,24 @@ def _generate_from_audio(
     _total_notes = sum(len(d.notes) for d in map_diffs)
     _total_events = sum(len(d.events) for d in map_diffs)
 
+    # Resolve cover art — use track's URL if available, otherwise look up via iTunes.
+    # Skip the network lookup if a real cover already exists on disk.
+    _art_t0 = _time.perf_counter()
+    cover_url = track.album_art_url
+    _art_searched = False
+    if not cover_url:
+        from smartsaber.artwork import lookup_album_art
+        from smartsaber.utils import safe_filename
+        _cover_folder = output_dir / safe_filename(
+            f"SmartSaber_{track.title} - {track.artist}"
+        )
+        _cover_path = _cover_folder / "cover.jpg"
+        _has_real_cover = _cover_path.exists() and _cover_path.stat().st_size > 2048
+        if not _has_real_cover:
+            cover_url = lookup_album_art(track.title, track.artist)
+            _art_searched = True
+    _art_elapsed = _time.perf_counter() - _art_t0
+
     on_stage("Writing files")
     _write_t0 = _time.perf_counter()
     folder = build_map(
@@ -752,7 +770,7 @@ def _generate_from_audio(
         difficulties=map_diffs,
         audio_path=audio_path,
         output_dir=output_dir,
-        cover_url=track.album_art_url,
+        cover_url=cover_url,
         song_name_for_folder=track.title,
         artist_for_folder=track.artist,
         analysis_cache_key=cache_key,
@@ -770,15 +788,18 @@ def _generate_from_audio(
     _hash_elapsed = _time.perf_counter() - _hash_t0
 
     _gen_elapsed = _time.perf_counter() - _gen_t0
-    _debug_callback(
+    _gen_msg = (
         f"    GEN {track.artist} – {track.title}: "
         f"total={_gen_elapsed:.3f}s  "
         f"analysis={_analysis_elapsed:.3f}s({'HIT' if _cache_hit else 'MISS'})  "
         f"notes={_notes_elapsed:.3f}s({_total_notes}n/{_total_events}ev)  "
+        f"art={_art_elapsed:.3f}s({'SEARCH' if _art_searched else 'skip'})  "
         f"write={_write_elapsed:.3f}s  hash={_hash_elapsed:.3f}s  "
         f"bpm={analysis.tempo:.1f}  dur={analysis.duration_s:.1f}s  "
         f"onsets={len(analysis.onset_times)}  beats={len(analysis.beat_times)}"
     )
+    logger.info(_gen_msg)
+    _debug_callback(_gen_msg)
 
     return GenerationResult(
         track=track,
