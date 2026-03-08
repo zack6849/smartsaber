@@ -17,6 +17,9 @@ __pycache__/
 # Local output
 output/
 
+# Corpus analysis cache (downloaded BeatSaver map zips)
+corpus_cache/
+
 # Personal playlist exports (CSV/JSON) — don't commit your own data
 *.csv
 *.json

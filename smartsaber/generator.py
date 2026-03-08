@@ -74,7 +74,7 @@ _DIFF_PARAMS: dict[Difficulty, DiffParams] = {
         crossover_chance=0.0,
     ),
     Difficulty.HARD: DiffParams(
-        min_gap_beats=0.5,        # 8th note minimum
+        min_gap_beats=0.75,       # corpus: Hard p25=1.0 beat — 0.75 gives some headroom
         onset_density=0.7,
         allow_doubles=True,
         # Corpus: Hard doubles rms=0.654, singles rms=0.603 — threshold midpoint
@@ -82,7 +82,7 @@ _DIFF_PARAMS: dict[Difficulty, DiffParams] = {
         crossover_chance=0.04,    # rare crossovers start appearing at Hard
     ),
     Difficulty.EXPERT: DiffParams(
-        min_gap_beats=0.333,      # triplet (3 notes per beat)
+        min_gap_beats=0.5,        # corpus: Expert p25=0.75 — 0.5 allows occasional tight pairs
         onset_density=0.85,
         allow_doubles=True,
         # Corpus: Expert doubles rms=0.648, singles rms=0.585
@@ -90,7 +90,7 @@ _DIFF_PARAMS: dict[Difficulty, DiffParams] = {
         crossover_chance=0.12,    # ~12% — corpus shows ~20% of Expert notes are crossovers
     ),
     Difficulty.EXPERT_PLUS: DiffParams(
-        min_gap_beats=0.25,       # 16th note minimum
+        min_gap_beats=0.375,      # corpus: ExpertPlus p25=0.5 — allows fast streams at peaks
         onset_density=1.0,
         allow_doubles=True,
         # Corpus: ExpertPlus doubles rms=0.641, singles rms=0.571
@@ -175,8 +175,14 @@ def generate_difficulty(
     # First strong onset defines the offset for beat conversion
     first_onset = analysis.onset_times[0] if analysis.onset_times else 0.0
 
-    # Select onsets based on difficulty density
-    onsets = _select_onsets(analysis.onset_times, params.onset_density, rng)
+    # Select onsets based on difficulty density, with a song-position ramp.
+    # Corpus: human maps use ~70% of peak density in the intro, ramp up through
+    # the song, and taper ~20% in the outro.  This is consistent across all five
+    # difficulties (density profile index 0 ≈ 75% of index 2, index 7 ≈ 85%).
+    onsets = _select_onsets_ramped(
+        analysis.onset_times, params.onset_density,
+        analysis.duration_s, rng,
+    )
 
     # State per hand — hands start at center columns, waist height (row 0)
     # which is the natural resting position with arms at sides.
@@ -306,6 +312,50 @@ def _select_onsets(
     step = max(1, len(onset_times) / n)
     indices = sorted(set(int(i * step) for i in range(n)))
     return [onset_times[i] for i in indices if i < len(onset_times)]
+
+
+def _select_onsets_ramped(
+    onset_times: list[float],
+    density: float,
+    duration_s: float,
+    rng: random.Random,
+) -> list[float]:
+    """
+    Select onsets with a song-position density ramp.
+
+    Corpus analysis shows human maps use ~70-75% of peak density in the intro
+    and ~80-85% in the outro, ramping up through the first quarter and tapering
+    in the last.  This prevents the map from feeling equally busy from start to
+    finish — a common problem with naive auto-generators.
+
+    Position multipliers (derived from corpus density profiles):
+      intro  (0-12.5%):  0.70× base density
+      early  (12.5-25%): 0.90×
+      mid    (25-75%):   1.00× (peak)
+      late   (75-87.5%): 0.90×
+      outro  (87.5-100%): 0.80×
+    """
+    if not onset_times or duration_s <= 0:
+        return _select_onsets(onset_times, density, rng)
+
+    def _position_mult(t: float) -> float:
+        pos = t / duration_s
+        if pos < 0.125:
+            return 0.70
+        if pos < 0.25:
+            return 0.90
+        if pos < 0.75:
+            return 1.00
+        if pos < 0.875:
+            return 0.90
+        return 0.80
+
+    result = []
+    for t in onset_times:
+        effective_density = density * _position_mult(t)
+        if effective_density >= 1.0 or rng.random() < effective_density:
+            result.append(t)
+    return result
 
 
 def _other_hand(h: NoteType) -> NoteType:
